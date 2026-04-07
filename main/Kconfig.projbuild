@@ -1,0 +1,120 @@
+menu "USB/IP Bridge Configuration"
+
+choice USBIP_TRANSPORT
+    prompt "Network transport"
+    default USBIP_TRANSPORT_ETHERNET if IDF_TARGET_ESP32P4
+    default USBIP_TRANSPORT_WIFI if IDF_TARGET_ESP32S3
+    default USBIP_TRANSPORT_ETHERNET
+
+    config USBIP_TRANSPORT_ETHERNET
+        bool "Ethernet"
+        depends on IDF_TARGET_ESP32P4
+    config USBIP_TRANSPORT_WIFI
+        bool "Wi-Fi STA"
+        depends on IDF_TARGET_ESP32S3
+endchoice
+
+if USBIP_TRANSPORT_ETHERNET
+
+config USBIP_ETH_MDC_GPIO
+    int "Ethernet MDC GPIO"
+    default 31
+
+config USBIP_ETH_MDIO_GPIO
+    int "Ethernet MDIO GPIO"
+    default 52
+
+config USBIP_ETH_PHY_ADDR
+    int "Ethernet PHY address"
+    range 0 31
+    default 1
+
+config USBIP_ETH_PHY_RST_GPIO
+    int "Ethernet PHY reset GPIO (-1 to disable)"
+    default 51
+
+endif
+
+if USBIP_TRANSPORT_WIFI
+
+config USBIP_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+
+config USBIP_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+
+config USBIP_WIFI_MAX_RETRY
+    int "Wi-Fi max retries"
+    range 1 50
+    default 10
+
+config USBIP_WIFI_AUTHMODE
+    int "Minimum AP auth mode (0=OPEN, 1=WPA, 2=WPA2, 3=WPA2/WPA3)"
+    range 0 3
+    default 3
+
+config USBIP_WIFI_DISABLE_MODEM_SLEEP
+    bool "Disable Wi-Fi modem sleep (WIFI_PS_NONE)"
+    default y
+    help
+        Keeps Wi-Fi radio fully active after association. This increases power
+        usage but improves latency and avoids Wi-Fi power-save side effects
+        during USB host bridging.
+
+endif
+
+if IDF_TARGET_ESP32S3
+
+config USBIP_S3_USB_OTG_DEVKIT_POWER
+    bool "Enable ESP32-S3-USB-OTG board power GPIO setup"
+    default y
+    help
+        Configure the onboard power routing GPIOs used by the ESP32-S3-USB-OTG
+        board to provide VBUS in host mode.
+
+config USBIP_S3_USB_BOOST_EN_GPIO
+    int "S3 USB OTG BOOST_EN GPIO"
+    default 13
+    depends on USBIP_S3_USB_OTG_DEVKIT_POWER
+
+config USBIP_S3_USB_DEV_VBUS_EN_GPIO
+    int "S3 USB OTG DEV_VBUS_EN GPIO"
+    default 12
+    depends on USBIP_S3_USB_OTG_DEVKIT_POWER
+
+config USBIP_S3_USB_LIMIT_EN_GPIO
+    int "S3 USB OTG LIMIT_EN GPIO"
+    default 17
+    depends on USBIP_S3_USB_OTG_DEVKIT_POWER
+
+config USBIP_S3_USB_SEL_GPIO
+    int "S3 USB OTG USB_SEL GPIO"
+    default 18
+    depends on USBIP_S3_USB_OTG_DEVKIT_POWER
+
+endif
+
+config USBIP_SERVER_TASK_STACK
+    int "USB/IP server task stack (bytes)"
+    default 8192
+
+config USBIP_SERVER_TASK_PRIORITY
+    int "USB/IP server task priority"
+    default 8
+
+config USBIP_MAX_TRANSFER
+    int "Maximum transfer payload size"
+    range 64 16384
+    default 4096
+
+config USBIP_MAX_DEVICES
+    int "Maximum exported USB devices"
+    range 1 16
+    default 8
+    help
+        Maximum number of simultaneously exported non-hub USB devices.
+        Increase this when using downstream hubs with multiple peripherals.
+
+endmenu
