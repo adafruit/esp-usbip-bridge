@@ -2,6 +2,7 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -84,8 +85,14 @@ static void discovery_task(void *arg)
 {
     (void)arg;
 
+    usbip_backend_device_t *devices = malloc(CONFIG_USBIP_MAX_DEVICES * sizeof(usbip_backend_device_t));
+    if (devices == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate device list");
+        vTaskDelete(NULL);
+        return;
+    }
+
     while (true) {
-        usbip_backend_device_t devices[CONFIG_USBIP_MAX_DEVICES];
         const size_t count = usb_backend_get_devices(devices, CONFIG_USBIP_MAX_DEVICES);
 
         discovery_snapshot_t current = {

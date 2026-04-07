@@ -1,5 +1,6 @@
 #include "network_init.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -8,6 +9,8 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "sdkconfig.h"
 
 #if CONFIG_USBIP_TRANSPORT_ETHERNET
@@ -113,6 +116,112 @@ static esp_err_t network_init_ethernet(void)
 #endif
 
 #if CONFIG_USBIP_TRANSPORT_WIFI
+
+#define WIFI_NVS_NAMESPACE "wifi"
+#define WIFI_NVS_KEY_SSID  "ssid"
+#define WIFI_NVS_KEY_PASS  "pass"
+#define WIFI_CRED_MAX_LEN  64
+#define WIFI_PROMPT_TIMEOUT_MS 3000
+
+/* Read a line from UART stdin, stripping trailing newline. Returns length. */
+static int uart_read_line(const char *prompt, char *buf, size_t buf_size, bool echo)
+{
+    printf("%s", prompt);
+    fflush(stdout);
+
+    int i = 0;
+    while (i < (int)(buf_size - 1)) {
+        int c = fgetc(stdin);
+        if (c == EOF) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (c == '\n' || c == '\r') {
+            if (echo) {
+                printf("\n");
+            }
+            break;
+        }
+        if (c == '\b' || c == 127) {  /* backspace / DEL */
+            if (i > 0) {
+                i--;
+                if (echo) {
+                    printf("\b \b");
+                    fflush(stdout);
+                }
+            }
+            continue;
+        }
+        buf[i++] = (char)c;
+        if (echo) {
+            printf("%c", c);
+        } else {
+            printf("*");
+        }
+        fflush(stdout);
+    }
+    buf[i] = '\0';
+    return i;
+}
+
+/* Check if the user presses a key within timeout_ms. */
+static bool uart_wait_for_keypress(int timeout_ms)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t deadline = start + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        int c = fgetc(stdin);
+        if (c != EOF) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return false;
+}
+
+static esp_err_t wifi_creds_save(const char *ssid, const char *password)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_str(nvs, WIFI_NVS_KEY_SSID, ssid);
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, WIFI_NVS_KEY_PASS, password);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+static esp_err_t wifi_creds_load(char *ssid, size_t ssid_size, char *password, size_t pass_size)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err != ESP_OK) return err;
+
+    err = nvs_get_str(nvs, WIFI_NVS_KEY_SSID, ssid, &ssid_size);
+    if (err == ESP_OK) {
+        err = nvs_get_str(nvs, WIFI_NVS_KEY_PASS, password, &pass_size);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+static void wifi_prompt_credentials(char *ssid, size_t ssid_size, char *password, size_t pass_size)
+{
+    printf("\n--- Wi-Fi Configuration ---\n");
+    while (true) {
+        uart_read_line("SSID: ", ssid, ssid_size, true);
+        if (strlen(ssid) > 0) break;
+        printf("SSID cannot be empty.\n");
+    }
+    uart_read_line("Password (empty for open): ", password, pass_size, false);
+    printf("\n");
+}
+
 static EventGroupHandle_t s_wifi_event_group;
 static const int WIFI_CONNECTED_BIT = BIT0;
 static const int WIFI_FAIL_BIT = BIT1;
@@ -161,10 +270,84 @@ static wifi_auth_mode_t wifi_authmode_from_config(void)
     }
 }
 
+static esp_err_t wifi_attempt_connect(const char *ssid, const char *password)
+{
+    s_wifi_retry_count = 0;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .threshold.authmode = wifi_authmode_from_config(),
+            .pmf_cfg = {
+                .capable = true,
+                .required = false,
+            },
+        },
+    };
+    strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+#if CONFIG_USBIP_WIFI_DISABLE_MODEM_SLEEP
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+#endif
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Wi-Fi connected to SSID \"%s\"", ssid);
+        return ESP_OK;
+    }
+
+    ESP_LOGE(TAG, "Wi-Fi failed to connect to SSID \"%s\"", ssid);
+    esp_wifi_stop();
+    return ESP_FAIL;
+}
+
 static esp_err_t network_init_wifi(void)
 {
-    if (strlen(CONFIG_USBIP_WIFI_SSID) == 0) {
-        ESP_LOGE(TAG, "Wi-Fi SSID is empty. Set USBIP_WIFI_SSID in menuconfig or sdkconfig defaults.");
+    char ssid[WIFI_CRED_MAX_LEN] = {0};
+    char password[WIFI_CRED_MAX_LEN] = {0};
+    bool need_prompt = false;
+
+    /* Try loading credentials from NVS */
+    esp_err_t err = wifi_creds_load(ssid, sizeof(ssid), password, sizeof(password));
+    if (err == ESP_OK && strlen(ssid) > 0) {
+        ESP_LOGI(TAG, "Saved Wi-Fi SSID: \"%s\"", ssid);
+        printf("Press any key within 3s to reconfigure Wi-Fi...\n");
+        if (uart_wait_for_keypress(WIFI_PROMPT_TIMEOUT_MS)) {
+            need_prompt = true;
+        }
+    } else {
+        /* No saved credentials — fall back to Kconfig if set */
+        if (strlen(CONFIG_USBIP_WIFI_SSID) > 0) {
+            strlcpy(ssid, CONFIG_USBIP_WIFI_SSID, sizeof(ssid));
+            strlcpy(password, CONFIG_USBIP_WIFI_PASSWORD, sizeof(password));
+            ESP_LOGI(TAG, "Using Kconfig Wi-Fi SSID: \"%s\"", ssid);
+            printf("Press any key within 3s to reconfigure Wi-Fi...\n");
+            if (uart_wait_for_keypress(WIFI_PROMPT_TIMEOUT_MS)) {
+                need_prompt = true;
+            }
+        } else {
+            need_prompt = true;
+        }
+    }
+
+    if (need_prompt) {
+        wifi_prompt_credentials(ssid, sizeof(ssid), password, sizeof(password));
+        err = wifi_creds_save(ssid, password);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save Wi-Fi credentials to NVS: %s", esp_err_to_name(err));
+        }
+    }
+
+    if (strlen(ssid) == 0) {
+        ESP_LOGE(TAG, "Wi-Fi SSID is empty.");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -191,39 +374,22 @@ static esp_err_t network_init_wifi(void)
                                                         NULL,
                                                         &instance_got_ip));
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .threshold.authmode = wifi_authmode_from_config(),
-            .pmf_cfg = {
-                .capable = true,
-                .required = false,
-            },
-        },
-    };
-    strlcpy((char *)wifi_config.sta.ssid, CONFIG_USBIP_WIFI_SSID, sizeof(wifi_config.sta.ssid));
-    strlcpy((char *)wifi_config.sta.password, CONFIG_USBIP_WIFI_PASSWORD, sizeof(wifi_config.sta.password));
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-#if CONFIG_USBIP_WIFI_DISABLE_MODEM_SLEEP
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    ESP_LOGI(TAG, "Wi-Fi power save disabled (WIFI_PS_NONE)");
-#endif
 
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                           pdFALSE,
-                                           pdFALSE,
-                                           portMAX_DELAY);
+    /* Connection loop: retry with new credentials on failure */
+    while (true) {
+        err = wifi_attempt_connect(ssid, password);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
 
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Wi-Fi connected to SSID \"%s\"", CONFIG_USBIP_WIFI_SSID);
-        return ESP_OK;
+        printf("\nWi-Fi connection failed. Enter new credentials.\n");
+        wifi_prompt_credentials(ssid, sizeof(ssid), password, sizeof(password));
+        err = wifi_creds_save(ssid, password);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save Wi-Fi credentials to NVS: %s", esp_err_to_name(err));
+        }
     }
-
-    ESP_LOGE(TAG, "Wi-Fi failed to connect to SSID \"%s\"", CONFIG_USBIP_WIFI_SSID);
-    return ESP_FAIL;
 }
 #endif
 

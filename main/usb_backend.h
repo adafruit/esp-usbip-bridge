@@ -16,6 +16,15 @@ typedef struct {
     uint8_t interface_protocol;
 } usbip_backend_interface_t;
 
+#define USBIP_MAX_ENDPOINTS 16
+
+typedef struct {
+    uint8_t address;
+    uint8_t attributes;
+    uint16_t max_packet_size;
+    uint8_t interval;
+} usbip_backend_endpoint_t;
+
 typedef struct {
     bool present;
     char path[256];
@@ -33,6 +42,8 @@ typedef struct {
     uint8_t num_configurations;
     uint8_t num_interfaces;
     usbip_backend_interface_t interfaces[USBIP_MAX_INTERFACES];
+    uint8_t num_endpoints;
+    usbip_backend_endpoint_t endpoints[USBIP_MAX_ENDPOINTS];
 } usbip_backend_device_t;
 
 esp_err_t usb_backend_start(void);
@@ -52,5 +63,13 @@ int usb_backend_bulk_transfer(const char busid[32],
                               uint8_t *in_data,
                               size_t in_capacity,
                               size_t *in_len);
+int usb_backend_interrupt_transfer(const char busid[32],
+                                   uint8_t endpoint_addr,
+                                   const uint8_t *out_data,
+                                   size_t out_len,
+                                   uint8_t *in_data,
+                                   size_t in_capacity,
+                                   size_t *in_len);
+bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uint8_t direction);
 
 #endif

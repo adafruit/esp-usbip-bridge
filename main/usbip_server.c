@@ -200,6 +200,7 @@ static bool handle_submit(int fd,
     const int32_t req_len = (int32_t)ntohl((uint32_t)request->u.cmd_submit.transfer_buffer_length);
     const uint32_t packet_count = (uint32_t)ntohl((uint32_t)request->u.cmd_submit.number_of_packets);
 
+
     if (req_len < 0) {
         return send_ret_submit(fd, request, -EINVAL, NULL, 0);
     }
@@ -240,7 +241,10 @@ static bool handle_submit(int fd,
         }
     }
 
-    if (packet_count != USBIP_NON_ISO_PACKETS) {
+    /* The kernel sends number_of_packets=0 for non-ISO transfers while
+       some clients send 0xFFFFFFFF (-1).  Reject only positive values,
+       which indicate actual isochronous packet counts (unsupported). */
+    if (packet_count != USBIP_NON_ISO_PACKETS && packet_count != 0) {
         free(out_buf);
         return send_ret_submit(fd, request, -EOPNOTSUPP, NULL, 0);
     }
@@ -277,17 +281,27 @@ static bool handle_submit(int fd,
                                               in_cap,
                                               &in_len);
     } else {
-        /* Bulk (or interrupt) transfer on a non-zero endpoint. */
+        /* Bulk or interrupt transfer on a non-zero endpoint. */
         const uint8_t ep_addr = (uint8_t)(endpoint |
                                           (direction == USBIP_DIR_IN ? 0x80 : 0x00));
 
-        status = usb_backend_bulk_transfer(imported_busid,
-                                           ep_addr,
-                                           out_buf,
-                                           (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
-                                           in_buf,
-                                           in_cap,
-                                           &in_len);
+        if (usb_backend_is_interrupt_endpoint(imported_busid, endpoint, direction == USBIP_DIR_IN)) {
+            status = usb_backend_interrupt_transfer(imported_busid,
+                                                    ep_addr,
+                                                    out_buf,
+                                                    (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
+                                                    in_buf,
+                                                    in_cap,
+                                                    &in_len);
+        } else {
+            status = usb_backend_bulk_transfer(imported_busid,
+                                               ep_addr,
+                                               out_buf,
+                                               (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
+                                               in_buf,
+                                               in_cap,
+                                               &in_len);
+        }
     }
 
     const bool ok = send_ret_submit(fd,
@@ -328,24 +342,32 @@ static bool handle_urb_stream(int fd, const char imported_busid[32], uint32_t ex
 
 static bool handle_devlist_request(int fd)
 {
-    usbip_backend_device_t devices[CONFIG_USBIP_MAX_DEVICES];
+    usbip_backend_device_t *devices = malloc(CONFIG_USBIP_MAX_DEVICES * sizeof(usbip_backend_device_t));
+    if (devices == NULL) {
+        return false;
+    }
+
     const size_t device_count = usb_backend_get_devices(devices, CONFIG_USBIP_MAX_DEVICES);
 
     if (!send_op_common(fd, USBIP_OP_REP_DEVLIST, 0)) {
+        free(devices);
         return false;
     }
 
     const uint32_t count = htonl((uint32_t)device_count);
     if (!write_all(fd, &count, sizeof(count))) {
+        free(devices);
         return false;
     }
 
     for (size_t i = 0; i < device_count; i++) {
         if (!send_device_with_interfaces(fd, &devices[i])) {
+            free(devices);
             return false;
         }
     }
 
+    free(devices);
     return true;
 }
 

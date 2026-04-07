@@ -5,6 +5,7 @@
 #include "nvs_flash.h"
 
 #include "discovery_service.h"
+#include "log_server.h"
 #include "network_init.h"
 #include "usb_backend.h"
 #include "usbip_server.h"
@@ -24,6 +25,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     ESP_ERROR_CHECK(network_init_start());
+    ESP_ERROR_CHECK(log_server_start());
     ESP_ERROR_CHECK(usb_backend_start());
     ESP_ERROR_CHECK(discovery_service_start());
     ESP_ERROR_CHECK(usbip_server_start());

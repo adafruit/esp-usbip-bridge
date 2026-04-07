@@ -83,6 +83,7 @@ typedef struct {
     SemaphoreHandle_t state_mutex;
     QueueHandle_t ctrl_req_queue;
     QueueHandle_t bulk_req_queue;
+    QueueHandle_t intr_req_queue;
     QueueHandle_t event_queue;
 
     usb_host_client_handle_t client_hdl;
@@ -141,7 +142,7 @@ static uint32_t usb_speed_to_usbip(usb_speed_t speed)
     }
 }
 
-static void parse_interfaces(const usb_config_desc_t *config_desc, usbip_backend_device_t *device)
+static void parse_descriptors(const usb_config_desc_t *config_desc, usbip_backend_device_t *device)
 {
     if (config_desc == NULL || device == NULL) {
         return;
@@ -150,7 +151,8 @@ static void parse_interfaces(const usb_config_desc_t *config_desc, usbip_backend
     const uint8_t *raw = (const uint8_t *)config_desc;
     const size_t total_len = config_desc->wTotalLength;
 
-    uint8_t count = 0;
+    uint8_t intf_count = 0;
+    uint8_t ep_count = 0;
     for (size_t offset = 0; offset + 2 <= total_len;) {
         const uint8_t desc_len = raw[offset];
         const uint8_t desc_type = raw[offset + 1];
@@ -159,17 +161,24 @@ static void parse_interfaces(const usb_config_desc_t *config_desc, usbip_backend
             break;
         }
 
-        if (desc_type == USB_B_DESCRIPTOR_TYPE_INTERFACE && desc_len >= 9 && count < USBIP_MAX_INTERFACES) {
-            device->interfaces[count].interface_class = raw[offset + 5];
-            device->interfaces[count].interface_subclass = raw[offset + 6];
-            device->interfaces[count].interface_protocol = raw[offset + 7];
-            count++;
+        if (desc_type == USB_B_DESCRIPTOR_TYPE_INTERFACE && desc_len >= 9 && intf_count < USBIP_MAX_INTERFACES) {
+            device->interfaces[intf_count].interface_class = raw[offset + 5];
+            device->interfaces[intf_count].interface_subclass = raw[offset + 6];
+            device->interfaces[intf_count].interface_protocol = raw[offset + 7];
+            intf_count++;
+        } else if (desc_type == USB_B_DESCRIPTOR_TYPE_ENDPOINT && desc_len >= 7 && ep_count < USBIP_MAX_ENDPOINTS) {
+            device->endpoints[ep_count].address = raw[offset + 2];
+            device->endpoints[ep_count].attributes = raw[offset + 3];
+            device->endpoints[ep_count].max_packet_size = raw[offset + 4] | (raw[offset + 5] << 8);
+            device->endpoints[ep_count].interval = raw[offset + 6];
+            ep_count++;
         }
 
         offset += desc_len;
     }
 
-    device->num_interfaces = count;
+    device->num_interfaces = intf_count;
+    device->num_endpoints = ep_count;
 }
 
 static bool is_hub_device(const usb_device_desc_t *dev_desc, const usbip_backend_device_t *device)
@@ -358,7 +367,7 @@ static void export_new_device(uint8_t address)
     const usb_config_desc_t *config_desc = NULL;
     err = usb_host_get_active_config_descriptor(dev_hdl, &config_desc);
     if (err == ESP_OK && config_desc != NULL) {
-        parse_interfaces(config_desc, &device);
+        parse_descriptors(config_desc, &device);
     }
 
     if (is_hub_device(dev_desc, &device)) {
@@ -690,6 +699,15 @@ static void usb_backend_task(void *arg)
             }
             xSemaphoreGive(bulk_req.done_sem);
         }
+
+        usb_backend_bulk_req_t intr_req;
+        while (xQueueReceive(s_state.intr_req_queue, &intr_req, 0) == pdTRUE) {
+            int status = process_bulk_request(&intr_req);
+            if (intr_req.status_out != NULL) {
+                *intr_req.status_out = status;
+            }
+            xSemaphoreGive(intr_req.done_sem);
+        }
     }
 }
 
@@ -716,6 +734,11 @@ esp_err_t usb_backend_start(void)
 
     s_state.bulk_req_queue = xQueueCreate(USB_BACKEND_QUEUE_LEN, sizeof(usb_backend_bulk_req_t));
     if (s_state.bulk_req_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_state.intr_req_queue = xQueueCreate(USB_BACKEND_QUEUE_LEN, sizeof(usb_backend_bulk_req_t));
+    if (s_state.intr_req_queue == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -887,4 +910,79 @@ int usb_backend_bulk_transfer(const char busid[32],
 
     vSemaphoreDelete(done_sem);
     return status;
+}
+
+int usb_backend_interrupt_transfer(const char busid[32],
+                                   uint8_t endpoint_addr,
+                                   const uint8_t *out_data,
+                                   size_t out_len,
+                                   uint8_t *in_data,
+                                   size_t in_capacity,
+                                   size_t *in_len)
+{
+    if (busid == NULL || in_len == NULL) {
+        return -EINVAL;
+    }
+
+    SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
+    if (done_sem == NULL) {
+        return -ENOMEM;
+    }
+
+    int status = -EIO;
+    *in_len = 0;
+
+    usb_backend_bulk_req_t req;
+    memset(&req, 0, sizeof(req));
+
+    memcpy(req.busid, busid, sizeof(req.busid));
+    req.endpoint_addr = endpoint_addr;
+    req.out_data = out_data;
+    req.out_len = out_len;
+    req.in_data = in_data;
+    req.in_capacity = in_capacity;
+    req.in_len_out = in_len;
+    req.status_out = &status;
+    req.done_sem = done_sem;
+
+    if (xQueueSend(s_state.intr_req_queue, &req, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        vSemaphoreDelete(done_sem);
+        return -EAGAIN;
+    }
+
+    if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(7000)) != pdTRUE) {
+        vSemaphoreDelete(done_sem);
+        return -ETIMEDOUT;
+    }
+
+    vSemaphoreDelete(done_sem);
+    return status;
+}
+
+bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uint8_t direction)
+{
+    if (busid == NULL) {
+        return false;
+    }
+
+    const uint8_t ep_addr = ep_num | (direction ? 0x80 : 0x00);
+
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    const int slot = find_slot_by_busid_locked(busid);
+    if (slot < 0) {
+        xSemaphoreGive(s_state.state_mutex);
+        return false;
+    }
+
+    const usbip_backend_device_t *device = &s_state.devices[slot].device;
+    for (uint8_t i = 0; i < device->num_endpoints; i++) {
+        if (device->endpoints[i].address == ep_addr) {
+            bool is_intr = (device->endpoints[i].attributes & 0x03) == 0x03;
+            xSemaphoreGive(s_state.state_mutex);
+            return is_intr;
+        }
+    }
+
+    xSemaphoreGive(s_state.state_mutex);
+    return false;
 }
