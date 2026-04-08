@@ -55,21 +55,24 @@ int usb_backend_control_transfer(const char busid[32],
                                  size_t out_len,
                                  uint8_t *in_data,
                                  size_t in_capacity,
-                                 size_t *in_len);
+                                 size_t *in_len,
+                                 volatile bool *cancel);
 int usb_backend_bulk_transfer(const char busid[32],
                               uint8_t endpoint_addr,
                               const uint8_t *out_data,
                               size_t out_len,
                               uint8_t *in_data,
                               size_t in_capacity,
-                              size_t *in_len);
+                              size_t *in_len,
+                              volatile bool *cancel);
 int usb_backend_interrupt_transfer(const char busid[32],
                                    uint8_t endpoint_addr,
                                    const uint8_t *out_data,
                                    size_t out_len,
                                    uint8_t *in_data,
                                    size_t in_capacity,
-                                   size_t *in_len);
+                                   size_t *in_len,
+                                   volatile bool *cancel);
 bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uint8_t direction);
 
 #endif

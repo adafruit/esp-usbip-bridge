@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <netinet/tcp.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -156,21 +158,25 @@ static bool send_ret_submit(int fd,
     reply.u.ret_submit.status = htonl((uint32_t)status);
     reply.u.ret_submit.actual_length = htonl(payload_len);
     reply.u.ret_submit.start_frame = htonl(0);
-    reply.u.ret_submit.number_of_packets = htonl(USBIP_NON_ISO_PACKETS);
+    reply.u.ret_submit.number_of_packets = htonl(0);
     reply.u.ret_submit.error_count = htonl(0);
     reply.u.ret_submit.padding = 0;
 
-    if (!write_all(fd, &reply, sizeof(reply))) {
-        return false;
-    }
-
+    /* Send header and payload in a single TCP segment so the kernel
+       can read both without waiting for a second segment. */
     if (payload_len > 0 && payload != NULL) {
-        if (!write_all(fd, payload, payload_len)) {
+        uint8_t *buf = malloc(sizeof(reply) + payload_len);
+        if (buf == NULL) {
             return false;
         }
+        memcpy(buf, &reply, sizeof(reply));
+        memcpy(buf + sizeof(reply), payload, payload_len);
+        bool ok = write_all(fd, buf, sizeof(reply) + payload_len);
+        free(buf);
+        return ok;
     }
 
-    return true;
+    return write_all(fd, &reply, sizeof(reply));
 }
 
 static bool send_ret_unlink(int fd, const usbip_header_t *request, int32_t status)
@@ -192,19 +198,34 @@ static bool send_ret_unlink(int fd, const usbip_header_t *request, int32_t statu
 static bool handle_submit(int fd,
                           const usbip_header_t *request,
                           const char imported_busid[32],
-                          uint32_t expected_devid)
+                          uint32_t expected_devid,
+                          volatile bool *cancel)
 {
+    const uint32_t seqnum = ntohl(request->base.seqnum);
     const uint32_t devid = ntohl(request->base.devid);
     const uint32_t direction = ntohl(request->base.direction);
     const uint32_t endpoint = ntohl(request->base.ep);
+    const uint32_t transfer_flags = ntohl(request->u.cmd_submit.transfer_flags);
     const int32_t req_len = (int32_t)ntohl((uint32_t)request->u.cmd_submit.transfer_buffer_length);
     const uint32_t packet_count = (uint32_t)ntohl((uint32_t)request->u.cmd_submit.number_of_packets);
 
+    ESP_LOGI(TAG, "CMD_SUBMIT seq=%"PRIu32" devid=0x%08"PRIx32" ep=%"PRIu32" dir=%s len=%"PRId32" flags=0x%"PRIx32" pkts=0x%08"PRIx32,
+             seqnum, devid, endpoint,
+             direction == USBIP_DIR_IN ? "IN" : "OUT",
+             req_len, transfer_flags, packet_count);
+
+    if (endpoint == 0) {
+        const uint8_t *s = request->u.cmd_submit.setup;
+        ESP_LOGI(TAG, "  setup: bmReqType=0x%02x bReq=0x%02x wValue=0x%04x wIndex=0x%04x wLength=0x%04x",
+                 s[0], s[1], s[2] | (s[3] << 8), s[4] | (s[5] << 8), s[6] | (s[7] << 8));
+    }
 
     if (req_len < 0) {
+        ESP_LOGW(TAG, "  -> EINVAL (req_len < 0)");
         return send_ret_submit(fd, request, -EINVAL, NULL, 0);
     }
     if (req_len > CONFIG_USBIP_MAX_TRANSFER) {
+        ESP_LOGW(TAG, "  -> EMSGSIZE (req_len %"PRId32" > max %d)", req_len, CONFIG_USBIP_MAX_TRANSFER);
         if (direction == USBIP_DIR_OUT && req_len > 0) {
             if (!discard_exact(fd, (size_t)req_len)) {
                 return false;
@@ -213,10 +234,12 @@ static bool handle_submit(int fd,
         return send_ret_submit(fd, request, -EMSGSIZE, NULL, 0);
     }
     if (direction != USBIP_DIR_OUT && direction != USBIP_DIR_IN) {
+        ESP_LOGW(TAG, "  -> bad direction %"PRIu32, direction);
         return false;
     }
 
     if (devid != expected_devid) {
+        ESP_LOGW(TAG, "  -> ENODEV (devid 0x%08"PRIx32" != expected 0x%08"PRIx32")", devid, expected_devid);
         if (direction == USBIP_DIR_OUT && req_len > 0) {
             if (!discard_exact(fd, (size_t)req_len)) {
                 return false;
@@ -245,6 +268,7 @@ static bool handle_submit(int fd,
        some clients send 0xFFFFFFFF (-1).  Reject only positive values,
        which indicate actual isochronous packet counts (unsupported). */
     if (packet_count != USBIP_NON_ISO_PACKETS && packet_count != 0) {
+        ESP_LOGW(TAG, "  -> EOPNOTSUPP (iso packet_count=%"PRIu32")", packet_count);
         free(out_buf);
         return send_ret_submit(fd, request, -EOPNOTSUPP, NULL, 0);
     }
@@ -279,7 +303,9 @@ static bool handle_submit(int fd,
                                               (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
                                               in_buf,
                                               in_cap,
-                                              &in_len);
+                                              &in_len,
+                                              cancel);
+        ESP_LOGI(TAG, "  ctrl_transfer -> status=%d in_len=%zu", status, in_len);
     } else {
         /* Bulk or interrupt transfer on a non-zero endpoint. */
         const uint8_t ep_addr = (uint8_t)(endpoint |
@@ -292,7 +318,9 @@ static bool handle_submit(int fd,
                                                     (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
                                                     in_buf,
                                                     in_cap,
-                                                    &in_len);
+                                                    &in_len,
+                                                    cancel);
+            ESP_LOGI(TAG, "  intr_transfer ep=0x%02x -> status=%d in_len=%zu", ep_addr, status, in_len);
         } else {
             status = usb_backend_bulk_transfer(imported_busid,
                                                ep_addr,
@@ -300,7 +328,9 @@ static bool handle_submit(int fd,
                                                (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
                                                in_buf,
                                                in_cap,
-                                               &in_len);
+                                               &in_len,
+                                               cancel);
+            ESP_LOGI(TAG, "  bulk_transfer ep=0x%02x -> status=%d in_len=%zu", ep_addr, status, in_len);
         }
     }
 
@@ -316,20 +346,80 @@ static bool handle_submit(int fd,
     return ok;
 }
 
+typedef struct {
+    int fd;
+    volatile bool cancel;
+} urb_stream_ctx_t;
+
+static void socket_watchdog_task(void *arg)
+{
+    urb_stream_ctx_t *ctx = (urb_stream_ctx_t *)arg;
+    uint8_t probe;
+
+    /* Poll the socket for disconnect while a transfer is in progress.
+       When recv returns 0 or error, the client is gone. */
+    while (!ctx->cancel) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(ctx->fd, &readfds);
+
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 }; /* 50ms */
+        int ret = select(ctx->fd + 1, &readfds, NULL, NULL, &tv);
+        if (ret > 0) {
+            /* Socket is readable — either data arrived or it's closed. */
+            ret = recv(ctx->fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (ret <= 0) {
+                ESP_LOGI(TAG, "Socket watchdog: client disconnected");
+                ctx->cancel = true;
+                break;
+            }
+            /* Data available means the main loop will read it. */
+            break;
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+
 static bool handle_urb_stream(int fd, const char imported_busid[32], uint32_t expected_devid)
 {
+    urb_stream_ctx_t ctx = {
+        .fd = fd,
+        .cancel = false,
+    };
+
     while (true) {
         usbip_header_t request;
         if (!read_exact(fd, &request, sizeof(request))) {
+            ESP_LOGI(TAG, "URB stream: read failed (client disconnected?)");
             return false;
         }
 
+        ctx.cancel = false;
+
         const uint32_t command = ntohl(request.base.command);
         if (command == USBIP_CMD_SUBMIT) {
-            if (!handle_submit(fd, &request, imported_busid, expected_devid)) {
+            /* Start a watchdog that sets cancel if the client disconnects
+               while we are blocked in a USB transfer. */
+            TaskHandle_t watchdog = NULL;
+            xTaskCreate(socket_watchdog_task, "sock_wd", 2048, &ctx,
+                        CONFIG_USBIP_SERVER_TASK_PRIORITY, &watchdog);
+
+            bool ok = handle_submit(fd, &request, imported_busid, expected_devid, &ctx.cancel);
+
+            /* Stop the watchdog if it's still running. */
+            ctx.cancel = true;
+            if (watchdog != NULL) {
+                /* Give it time to exit */
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+
+            if (!ok) {
+                ESP_LOGW(TAG, "URB stream: handle_submit failed");
                 return false;
             }
         } else if (command == USBIP_CMD_UNLINK) {
+            ESP_LOGI(TAG, "CMD_UNLINK seq=%"PRIu32, ntohl(request.base.seqnum));
             if (!send_ret_unlink(fd, &request, 0)) {
                 return false;
             }
@@ -389,7 +479,15 @@ static bool handle_import_request(int fd)
         return true;
     }
 
-    if (!send_device_with_interfaces(fd, &device)) {
+    /* Import reply sends only the device descriptor, NOT the interface
+       descriptors.  The Linux usbip userspace tool (usbip_attach.c)
+       reads only sizeof(struct usbip_usb_device) — the interface
+       descriptors in op_import_reply are commented out in the kernel
+       source.  Any extra bytes left in the TCP buffer would be
+       misinterpreted as URB PDU data by the kernel driver. */
+    usbip_device_desc_t wire_device;
+    fill_wire_device_desc(&device, &wire_device);
+    if (!write_all(fd, &wire_device, sizeof(wire_device))) {
         return false;
     }
 
@@ -469,6 +567,9 @@ static void usbip_server_task(void *arg)
             ESP_LOGW(TAG, "accept() failed: errno=%d", errno);
             continue;
         }
+
+        int nodelay = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
         ESP_LOGI(TAG, "Client connected");
         handle_client(client_fd);

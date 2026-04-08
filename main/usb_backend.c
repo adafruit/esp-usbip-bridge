@@ -53,6 +53,7 @@ typedef struct {
     size_t in_capacity;
     size_t *in_len_out;
     int *status_out;
+    volatile bool *cancel;
     SemaphoreHandle_t done_sem;
 } usb_backend_ctrl_req_t;
 
@@ -65,11 +66,13 @@ typedef struct {
     size_t in_capacity;
     size_t *in_len_out;
     int *status_out;
+    volatile bool *cancel;
     SemaphoreHandle_t done_sem;
 } usb_backend_bulk_req_t;
 
 typedef struct {
     bool done;
+    volatile bool *cancel;
 } transfer_done_ctx_t;
 
 typedef struct {
@@ -512,6 +515,7 @@ static int process_control_request(const usb_backend_ctrl_req_t *req)
 
     transfer_done_ctx_t done_ctx = {
         .done = false,
+        .cancel = req->cancel,
     };
 
     transfer->callback = control_transfer_done_cb;
@@ -531,6 +535,10 @@ static int process_control_request(const usb_backend_ctrl_req_t *req)
     }
 
     while (!done_ctx.done) {
+        if (req->cancel != NULL && *req->cancel) {
+            usb_host_transfer_free(transfer);
+            return -ECONNRESET;
+        }
         err = usb_host_client_handle_events(s_state.client_hdl, pdMS_TO_TICKS(10));
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
             break;
@@ -582,8 +590,42 @@ static int process_bulk_request(const usb_backend_bulk_req_t *req)
         return -EMSGSIZE;
     }
 
+    /* For IN transfers, the ESP USB host controller requires num_bytes to
+       be a multiple of MPS.  Round up the allocation and transfer size,
+       then cap actual_num_bytes to the original requested length. */
+    size_t xfer_len = payload_len;
+    if (is_in && payload_len > 0) {
+        /* Look up endpoint MPS from the device descriptor cache. */
+        xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+        const int ep_slot = find_slot_by_busid_locked(req->busid);
+        uint16_t mps = 64;  /* safe default */
+        if (ep_slot >= 0) {
+            usb_device_handle_t ep_dev = s_state.devices[ep_slot].dev_hdl;
+            const usb_config_desc_t *cfg = NULL;
+            if (usb_host_get_active_config_descriptor(ep_dev, &cfg) == ESP_OK && cfg != NULL) {
+                int offset = 0;
+                const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg, 0, 0, &offset);
+                if (intf != NULL) {
+                    const usb_ep_desc_t *ep = NULL;
+                    for (int i = 0; i < intf->bNumEndpoints; i++) {
+                        ep = usb_parse_endpoint_descriptor_by_index(intf, i, cfg->wTotalLength, &offset);
+                        if (ep != NULL && ep->bEndpointAddress == req->endpoint_addr) {
+                            mps = ep->wMaxPacketSize;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        xSemaphoreGive(s_state.state_mutex);
+
+        if (mps > 0 && (xfer_len % mps) != 0) {
+            xfer_len = ((xfer_len + mps - 1) / mps) * mps;
+        }
+    }
+
     usb_transfer_t *transfer = NULL;
-    esp_err_t err = usb_host_transfer_alloc(payload_len, 0, &transfer);
+    esp_err_t err = usb_host_transfer_alloc(xfer_len, 0, &transfer);
     if (err != ESP_OK || transfer == NULL) {
         return -ENOMEM;
     }
@@ -594,13 +636,14 @@ static int process_bulk_request(const usb_backend_bulk_req_t *req)
 
     transfer_done_ctx_t done_ctx = {
         .done = false,
+        .cancel = req->cancel,
     };
 
     transfer->callback = control_transfer_done_cb;
     transfer->context = &done_ctx;
     transfer->device_handle = dev_hdl;
     transfer->bEndpointAddress = req->endpoint_addr;
-    transfer->num_bytes = payload_len;
+    transfer->num_bytes = xfer_len;
     transfer->timeout_ms = 5000;
 
     err = usb_host_transfer_submit(transfer);
@@ -613,6 +656,10 @@ static int process_bulk_request(const usb_backend_bulk_req_t *req)
     }
 
     while (!done_ctx.done) {
+        if (req->cancel != NULL && *req->cancel) {
+            usb_host_transfer_free(transfer);
+            return -ECONNRESET;
+        }
         err = usb_host_client_handle_events(s_state.client_hdl, pdMS_TO_TICKS(10));
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
             break;
@@ -622,7 +669,11 @@ static int process_bulk_request(const usb_backend_bulk_req_t *req)
 
     int status = map_transfer_status_to_errno(transfer->status);
     if (status == 0 && is_in && req->in_data != NULL && req->in_capacity > 0) {
-        const size_t bytes = transfer->actual_num_bytes;
+        /* Cap to the original requested length, not the rounded-up xfer_len. */
+        size_t bytes = transfer->actual_num_bytes;
+        if (bytes > payload_len) {
+            bytes = payload_len;
+        }
         const size_t copy_len = (bytes > req->in_capacity) ? req->in_capacity : bytes;
         memcpy(req->in_data, transfer->data_buffer, copy_len);
         if (req->in_len_out != NULL) {
@@ -824,7 +875,8 @@ int usb_backend_control_transfer(const char busid[32],
                                  size_t out_len,
                                  uint8_t *in_data,
                                  size_t in_capacity,
-                                 size_t *in_len)
+                                 size_t *in_len,
+                                 volatile bool *cancel)
 {
     if (busid == NULL || setup == NULL || in_len == NULL) {
         return -EINVAL;
@@ -849,6 +901,7 @@ int usb_backend_control_transfer(const char busid[32],
     req.in_capacity = in_capacity;
     req.in_len_out = in_len;
     req.status_out = &status;
+    req.cancel = cancel;
     req.done_sem = done_sem;
 
     if (xQueueSend(s_state.ctrl_req_queue, &req, pdMS_TO_TICKS(1000)) != pdTRUE) {
@@ -871,7 +924,8 @@ int usb_backend_bulk_transfer(const char busid[32],
                               size_t out_len,
                               uint8_t *in_data,
                               size_t in_capacity,
-                              size_t *in_len)
+                              size_t *in_len,
+                              volatile bool *cancel)
 {
     if (busid == NULL || in_len == NULL) {
         return -EINVAL;
@@ -896,6 +950,7 @@ int usb_backend_bulk_transfer(const char busid[32],
     req.in_capacity = in_capacity;
     req.in_len_out = in_len;
     req.status_out = &status;
+    req.cancel = cancel;
     req.done_sem = done_sem;
 
     if (xQueueSend(s_state.bulk_req_queue, &req, pdMS_TO_TICKS(1000)) != pdTRUE) {
@@ -918,7 +973,8 @@ int usb_backend_interrupt_transfer(const char busid[32],
                                    size_t out_len,
                                    uint8_t *in_data,
                                    size_t in_capacity,
-                                   size_t *in_len)
+                                   size_t *in_len,
+                                   volatile bool *cancel)
 {
     if (busid == NULL || in_len == NULL) {
         return -EINVAL;
@@ -943,6 +999,7 @@ int usb_backend_interrupt_transfer(const char busid[32],
     req.in_capacity = in_capacity;
     req.in_len_out = in_len;
     req.status_out = &status;
+    req.cancel = cancel;
     req.done_sem = done_sem;
 
     if (xQueueSend(s_state.intr_req_queue, &req, pdMS_TO_TICKS(1000)) != pdTRUE) {
