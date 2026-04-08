@@ -8,6 +8,11 @@ CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_NUM=0
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
-# Enable USB host external hub support.
+# ESP32-P4 minimum chip revision v1.0 (mutually exclusive with v3.x)
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# Enable USB host external hub support (single tier only to conserve
+# DWC HCD channels — multi-level hubs consume too many of the 8 available).
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
-CONFIG_USB_HOST_HUB_MULTI_LEVEL=y
+CONFIG_USB_HOST_HUB_MULTI_LEVEL=n
