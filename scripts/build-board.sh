@@ -12,7 +12,7 @@ BOARD="${1:-}"
 ACTION="build"
 
 if [[ -z "${BOARD}" ]]; then
-    echo "Usage: $0 <p4-function-ev|s3-usb-otg> [build|flash|monitor|clean]" >&2
+    echo "Usage: $0 <p4-function-ev|m5stack-poe-p4|s3-usb-otg> [build|flash|monitor|clean]" >&2
     exit 1
 fi
 
@@ -20,10 +20,7 @@ if [[ $# -ge 2 ]]; then
     ACTION="${2}"
 fi
 
-if [[ $# -gt 2 ]]; then
-    echo "Usage: $0 <p4-function-ev|s3-usb-otg> [build|flash|monitor|clean]" >&2
-    exit 1
-fi
+PORT="${3:-}"
 
 case "${BOARD}" in
     p4-function-ev)
@@ -31,6 +28,12 @@ case "${BOARD}" in
         BUILD_DIR="build-p4-function-ev"
         SDKCONFIG_FILE="sdkconfig.p4-function-ev"
         DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.p4-function-ev"
+        ;;
+    m5stack-poe-p4)
+        TARGET="esp32p4"
+        BUILD_DIR="build-m5stack-poe-p4"
+        SDKCONFIG_FILE="sdkconfig.m5stack-poe-p4"
+        DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.m5stack-poe-p4"
         ;;
     s3-usb-otg)
         TARGET="esp32s3"
@@ -53,7 +56,13 @@ if [[ "${ACTION}" == "clean" ]]; then
     exit 0
 fi
 
+PORT_ARGS=()
+if [[ -n "${PORT}" ]]; then
+    PORT_ARGS=(-p "${PORT}")
+fi
+
 idf.py -B "${BUILD_DIR}" \
+    "${PORT_ARGS[@]}" \
     -DIDF_TARGET="${TARGET}" \
     -DSDKCONFIG="${SDKCONFIG_FILE}" \
     -DSDKCONFIG_DEFAULTS="${DEFAULTS}" \

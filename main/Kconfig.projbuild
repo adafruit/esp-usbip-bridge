@@ -117,4 +117,12 @@ config USBIP_MAX_DEVICES
         Maximum number of simultaneously exported non-hub USB devices.
         Increase this when using downstream hubs with multiple peripherals.
 
+config USBIP_NUM_PIPES
+    int "Number of USB host pipe request slots"
+    default 16 if IDF_TARGET_ESP32P4
+    default 8
+    help
+        Number of concurrent USB transfer request slots.  Should match the
+        DWC host controller channel count (16 for ESP32-P4, 8 for ESP32-S3).
+
 endmenu

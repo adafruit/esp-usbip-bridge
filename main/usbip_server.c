@@ -369,7 +369,6 @@ static void socket_watchdog_task(void *arg)
             /* Socket is readable — either data arrived or it's closed. */
             ret = recv(ctx->fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
             if (ret <= 0) {
-                ESP_LOGI(TAG, "Socket watchdog: client disconnected");
                 ctx->cancel = true;
                 break;
             }
@@ -402,7 +401,7 @@ static bool handle_urb_stream(int fd, const char imported_busid[32], uint32_t ex
             /* Start a watchdog that sets cancel if the client disconnects
                while we are blocked in a USB transfer. */
             TaskHandle_t watchdog = NULL;
-            xTaskCreate(socket_watchdog_task, "sock_wd", 2048, &ctx,
+            xTaskCreate(socket_watchdog_task, "sock_wd", 3072, &ctx,
                         CONFIG_USBIP_SERVER_TASK_PRIORITY, &watchdog);
 
             bool ok = handle_submit(fd, &request, imported_busid, expected_devid, &ctx.cancel);

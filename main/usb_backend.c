@@ -20,12 +20,13 @@
 #include "driver/gpio.h"
 #endif
 
-#define USB_BACKEND_QUEUE_LEN 8
 #define USB_BACKEND_EVENT_QUEUE_LEN 16
 #define USB_BACKEND_TASK_STACK 8192
 #define USB_BACKEND_TASK_PRIORITY 9
 #define USB_BACKEND_DAEMON_TASK_STACK 4096
 #define USB_BACKEND_DAEMON_TASK_PRIORITY 10
+
+#define USB_BACKEND_NUM_PIPES CONFIG_USBIP_NUM_PIPES
 
 #ifndef USB_CLASS_HUB
 #define USB_CLASS_HUB 0x09
@@ -44,9 +45,15 @@ typedef struct {
     } u;
 } usb_backend_event_t;
 
+/* Unified per-pipe request slot.  One slot per host pipe, shared across
+   all devices and endpoints.  The caller fills a free slot, sets
+   active = true, notifies the backend task, then waits on done_sem. */
 typedef struct {
+    bool assigned;                  /* true = reserved for a device+endpoint */
+    volatile bool active;           /* true = transfer pending */
     char busid[32];
-    usb_setup_packet_t setup;
+    uint8_t endpoint_addr;          /* 0 for control, 0x8N for IN, 0x0N for OUT */
+    usb_setup_packet_t setup;       /* only used when endpoint_addr == 0 */
     const uint8_t *out_data;
     size_t out_len;
     uint8_t *in_data;
@@ -54,21 +61,8 @@ typedef struct {
     size_t *in_len_out;
     int *status_out;
     volatile bool *cancel;
-    SemaphoreHandle_t done_sem;
-} usb_backend_ctrl_req_t;
-
-typedef struct {
-    char busid[32];
-    uint8_t endpoint_addr;
-    const uint8_t *out_data;
-    size_t out_len;
-    uint8_t *in_data;
-    size_t in_capacity;
-    size_t *in_len_out;
-    int *status_out;
-    volatile bool *cancel;
-    SemaphoreHandle_t done_sem;
-} usb_backend_bulk_req_t;
+    SemaphoreHandle_t done_sem;     /* pre-allocated, not per-call */
+} usb_backend_pipe_req_t;
 
 typedef struct {
     bool done;
@@ -80,14 +74,16 @@ typedef struct {
     bool interfaces_claimed;
     usb_device_handle_t dev_hdl;
     usbip_backend_device_t device;
+    int ep0_pipe;                                   /* pipe slot for EP0, -1 = none */
+    int ep_pipes[USBIP_MAX_ENDPOINTS];              /* pipe slot per endpoint, -1 = none */
 } usb_backend_device_slot_t;
 
 typedef struct {
     SemaphoreHandle_t state_mutex;
-    QueueHandle_t ctrl_req_queue;
-    QueueHandle_t bulk_req_queue;
-    QueueHandle_t intr_req_queue;
     QueueHandle_t event_queue;
+    TaskHandle_t task_hdl;
+
+    usb_backend_pipe_req_t pipes[USB_BACKEND_NUM_PIPES];
 
     usb_host_client_handle_t client_hdl;
     usb_backend_device_slot_t devices[CONFIG_USBIP_MAX_DEVICES];
@@ -255,13 +251,43 @@ static int find_free_slot_locked(void)
     return -1;
 }
 
+static int alloc_pipe_locked(void)
+{
+    for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
+        if (!s_state.pipes[i].assigned) {
+            s_state.pipes[i].assigned = true;
+            s_state.pipes[i].active = false;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void free_pipe_locked(int pipe)
+{
+    if (pipe >= 0 && pipe < USB_BACKEND_NUM_PIPES) {
+        s_state.pipes[pipe].assigned = false;
+        s_state.pipes[pipe].active = false;
+    }
+}
+
 static void clear_slot_locked(int slot)
 {
     if (slot < 0 || slot >= CONFIG_USBIP_MAX_DEVICES) {
         return;
     }
 
+    /* Free any assigned pipe slots. */
+    free_pipe_locked(s_state.devices[slot].ep0_pipe);
+    for (int i = 0; i < USBIP_MAX_ENDPOINTS; i++) {
+        free_pipe_locked(s_state.devices[slot].ep_pipes[i]);
+    }
+
     memset(&s_state.devices[slot], 0, sizeof(s_state.devices[slot]));
+    s_state.devices[slot].ep0_pipe = -1;
+    for (int i = 0; i < USBIP_MAX_ENDPOINTS; i++) {
+        s_state.devices[slot].ep_pipes[i] = -1;
+    }
 }
 
 static void release_interfaces_locked(int slot)
@@ -283,7 +309,49 @@ static void release_interfaces_locked(int slot)
         }
     }
 
+    /* Free endpoint pipe slots. */
+    for (int i = 0; i < USBIP_MAX_ENDPOINTS; i++) {
+        free_pipe_locked(s_state.devices[slot].ep_pipes[i]);
+        s_state.devices[slot].ep_pipes[i] = -1;
+    }
+
     s_state.devices[slot].interfaces_claimed = false;
+}
+
+static esp_err_t ensure_interfaces_claimed_locked(int slot)
+{
+    if (slot < 0 || slot >= CONFIG_USBIP_MAX_DEVICES || !s_state.devices[slot].in_use) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_state.devices[slot].interfaces_claimed) {
+        return ESP_OK;
+    }
+
+    usb_device_handle_t dev_hdl = s_state.devices[slot].dev_hdl;
+    const usbip_backend_device_t *device = &s_state.devices[slot].device;
+
+    ESP_LOGI(TAG, "Claiming %u interfaces for %s (lazy)", device->num_interfaces, device->busid);
+    for (uint8_t i = 0; i < device->num_interfaces; i++) {
+        esp_err_t err = usb_host_interface_claim(s_state.client_hdl, dev_hdl, i, 0);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "usb_host_interface_claim(%u) failed: %s", i, esp_err_to_name(err));
+            return err;
+        }
+    }
+
+    /* Assign a pipe slot for each endpoint. */
+    for (uint8_t i = 0; i < device->num_endpoints; i++) {
+        int pipe = alloc_pipe_locked();
+        if (pipe < 0) {
+            ESP_LOGE(TAG, "No free pipe slots for endpoint 0x%02x on %s",
+                     device->endpoints[i].address, device->busid);
+            return ESP_ERR_NO_MEM;
+        }
+        s_state.devices[slot].ep_pipes[i] = pipe;
+    }
+
+    s_state.devices[slot].interfaces_claimed = true;
+    return ESP_OK;
 }
 
 static void close_slot_locked(int slot)
@@ -311,9 +379,11 @@ static void usb_client_event_cb(const usb_host_client_event_msg_t *event_msg, vo
 
     usb_backend_event_t evt;
     if (event_msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+        ESP_LOGI(TAG, "USB device attached at address %u", event_msg->new_dev.address);
         evt.type = USB_BACKEND_EVENT_NEW_DEV;
         evt.u.address = event_msg->new_dev.address;
     } else if (event_msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        ESP_LOGW(TAG, "USB device detached");
         evt.type = USB_BACKEND_EVENT_DEV_GONE;
         evt.u.dev_hdl = event_msg->dev_gone.dev_hdl;
     } else {
@@ -402,14 +472,17 @@ static void export_new_device(uint8_t address)
     s_state.devices[free_slot].device = device;
     s_state.devices[free_slot].interfaces_claimed = false;
 
-    /* Claim all interfaces so bulk/interrupt endpoints are usable. */
-    for (uint8_t i = 0; i < device.num_interfaces; i++) {
-        esp_err_t claim_err = usb_host_interface_claim(s_state.client_hdl, dev_hdl, i, 0);
-        if (claim_err != ESP_OK) {
-            ESP_LOGW(TAG, "usb_host_interface_claim(%u) failed: %s", i, esp_err_to_name(claim_err));
-        }
+    /* Initialize pipe slot mappings. */
+    s_state.devices[free_slot].ep0_pipe = alloc_pipe_locked();
+    if (s_state.devices[free_slot].ep0_pipe < 0) {
+        ESP_LOGW(TAG, "No free pipe slot for EP0 on %s", device.busid);
     }
-    s_state.devices[free_slot].interfaces_claimed = true;
+    for (int i = 0; i < USBIP_MAX_ENDPOINTS; i++) {
+        s_state.devices[free_slot].ep_pipes[i] = -1;
+    }
+
+    /* Non-zero endpoint pipes are allocated lazily when interfaces are
+       claimed, to conserve HCD channels. */
 
     xSemaphoreGive(s_state.state_mutex);
 
@@ -473,155 +546,72 @@ static int map_transfer_status_to_errno(usb_transfer_status_t status)
     }
 }
 
-static int process_control_request(const usb_backend_ctrl_req_t *req)
+static uint16_t get_endpoint_mps_locked(int dev_slot, uint8_t endpoint_addr)
 {
-    if (req == NULL) {
-        return -EINVAL;
+    uint16_t mps = 64;  /* safe default */
+    usb_device_handle_t dev = s_state.devices[dev_slot].dev_hdl;
+    const usb_config_desc_t *cfg = NULL;
+    if (usb_host_get_active_config_descriptor(dev, &cfg) != ESP_OK || cfg == NULL) {
+        return mps;
     }
-
-    if (req->in_len_out != NULL) {
-        *req->in_len_out = 0;
-    }
-
-    usb_device_handle_t dev_hdl = NULL;
-    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-    const int slot = find_slot_by_busid_locked(req->busid);
-    if (slot >= 0) {
-        dev_hdl = s_state.devices[slot].dev_hdl;
-    }
-    xSemaphoreGive(s_state.state_mutex);
-
-    if (dev_hdl == NULL) {
-        return -ENODEV;
-    }
-
-    const bool is_in = (req->setup.bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) != 0;
-    const size_t payload_len = is_in ? req->in_capacity : req->out_len;
-    if (payload_len > CONFIG_USBIP_MAX_TRANSFER) {
-        return -EMSGSIZE;
-    }
-
-    usb_transfer_t *transfer = NULL;
-    const size_t transfer_size = USB_SETUP_PACKET_SIZE + payload_len;
-    esp_err_t err = usb_host_transfer_alloc(transfer_size, 0, &transfer);
-    if (err != ESP_OK || transfer == NULL) {
-        return -ENOMEM;
-    }
-
-    memcpy(transfer->data_buffer, &req->setup, USB_SETUP_PACKET_SIZE);
-    if (!is_in && req->out_len > 0 && req->out_data != NULL) {
-        memcpy(transfer->data_buffer + USB_SETUP_PACKET_SIZE, req->out_data, req->out_len);
-    }
-
-    transfer_done_ctx_t done_ctx = {
-        .done = false,
-        .cancel = req->cancel,
-    };
-
-    transfer->callback = control_transfer_done_cb;
-    transfer->context = &done_ctx;
-    transfer->device_handle = dev_hdl;
-    transfer->bEndpointAddress = 0;
-    transfer->num_bytes = transfer_size;
-    transfer->timeout_ms = 5000;
-
-    err = usb_host_transfer_submit_control(s_state.client_hdl, transfer);
-    if (err != ESP_OK) {
-        usb_host_transfer_free(transfer);
-        if (err == ESP_ERR_INVALID_STATE) {
-            return -ENODEV;
+    for (int intf_num = 0; intf_num < s_state.devices[dev_slot].device.num_interfaces; intf_num++) {
+        int offset = 0;
+        const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg, intf_num, 0, &offset);
+        if (intf == NULL) {
+            continue;
         }
-        return -EIO;
-    }
-
-    while (!done_ctx.done) {
-        if (req->cancel != NULL && *req->cancel) {
-            usb_host_transfer_free(transfer);
-            return -ECONNRESET;
-        }
-        err = usb_host_client_handle_events(s_state.client_hdl, pdMS_TO_TICKS(10));
-        if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
-            break;
-        }
-        process_backend_events();
-    }
-
-    int status = map_transfer_status_to_errno(transfer->status);
-    if (status == 0 && is_in && req->in_data != NULL && req->in_capacity > 0) {
-        const size_t bytes = (transfer->actual_num_bytes > USB_SETUP_PACKET_SIZE)
-                                 ? (transfer->actual_num_bytes - USB_SETUP_PACKET_SIZE)
-                                 : 0;
-        const size_t copy_len = (bytes > req->in_capacity) ? req->in_capacity : bytes;
-        memcpy(req->in_data, transfer->data_buffer + USB_SETUP_PACKET_SIZE, copy_len);
-        if (req->in_len_out != NULL) {
-            *req->in_len_out = copy_len;
-        }
-    }
-
-    usb_host_transfer_free(transfer);
-    return status;
-}
-
-static int process_bulk_request(const usb_backend_bulk_req_t *req)
-{
-    if (req == NULL) {
-        return -EINVAL;
-    }
-
-    if (req->in_len_out != NULL) {
-        *req->in_len_out = 0;
-    }
-
-    usb_device_handle_t dev_hdl = NULL;
-    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-    const int slot = find_slot_by_busid_locked(req->busid);
-    if (slot >= 0) {
-        dev_hdl = s_state.devices[slot].dev_hdl;
-    }
-    xSemaphoreGive(s_state.state_mutex);
-
-    if (dev_hdl == NULL) {
-        return -ENODEV;
-    }
-
-    const bool is_in = (req->endpoint_addr & 0x80) != 0;
-    const size_t payload_len = is_in ? req->in_capacity : req->out_len;
-    if (payload_len > CONFIG_USBIP_MAX_TRANSFER) {
-        return -EMSGSIZE;
-    }
-
-    /* For IN transfers, the ESP USB host controller requires num_bytes to
-       be a multiple of MPS.  Round up the allocation and transfer size,
-       then cap actual_num_bytes to the original requested length. */
-    size_t xfer_len = payload_len;
-    if (is_in && payload_len > 0) {
-        /* Look up endpoint MPS from the device descriptor cache. */
-        xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
-        const int ep_slot = find_slot_by_busid_locked(req->busid);
-        uint16_t mps = 64;  /* safe default */
-        if (ep_slot >= 0) {
-            usb_device_handle_t ep_dev = s_state.devices[ep_slot].dev_hdl;
-            const usb_config_desc_t *cfg = NULL;
-            if (usb_host_get_active_config_descriptor(ep_dev, &cfg) == ESP_OK && cfg != NULL) {
-                int offset = 0;
-                const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg, 0, 0, &offset);
-                if (intf != NULL) {
-                    const usb_ep_desc_t *ep = NULL;
-                    for (int i = 0; i < intf->bNumEndpoints; i++) {
-                        ep = usb_parse_endpoint_descriptor_by_index(intf, i, cfg->wTotalLength, &offset);
-                        if (ep != NULL && ep->bEndpointAddress == req->endpoint_addr) {
-                            mps = ep->wMaxPacketSize;
-                            break;
-                        }
-                    }
-                }
+        for (int i = 0; i < intf->bNumEndpoints; i++) {
+            const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(intf, i, cfg->wTotalLength, &offset);
+            if (ep != NULL && ep->bEndpointAddress == endpoint_addr) {
+                return ep->wMaxPacketSize;
             }
         }
-        xSemaphoreGive(s_state.state_mutex);
+    }
+    return mps;
+}
 
+static int process_pipe_request(usb_backend_pipe_req_t *req)
+{
+    if (req->in_len_out != NULL) {
+        *req->in_len_out = 0;
+    }
+
+    const bool is_control = (req->endpoint_addr == 0);
+    const bool is_in = is_control
+        ? (req->setup.bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) != 0
+        : (req->endpoint_addr & 0x80) != 0;
+
+    usb_device_handle_t dev_hdl = NULL;
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    const int dev_slot = find_slot_by_busid_locked(req->busid);
+    if (dev_slot >= 0) {
+        if (!is_control) {
+            esp_err_t claim_err = ensure_interfaces_claimed_locked(dev_slot);
+            if (claim_err != ESP_OK) {
+                xSemaphoreGive(s_state.state_mutex);
+                return -EIO;
+            }
+        }
+        dev_hdl = s_state.devices[dev_slot].dev_hdl;
+    }
+
+    const size_t payload_len = is_in ? req->in_capacity : req->out_len;
+
+    /* For IN bulk/interrupt, round up to MPS while we hold the mutex. */
+    size_t xfer_len = is_control ? (USB_SETUP_PACKET_SIZE + payload_len) : payload_len;
+    if (!is_control && is_in && payload_len > 0 && dev_slot >= 0) {
+        uint16_t mps = get_endpoint_mps_locked(dev_slot, req->endpoint_addr);
         if (mps > 0 && (xfer_len % mps) != 0) {
             xfer_len = ((xfer_len + mps - 1) / mps) * mps;
         }
+    }
+    xSemaphoreGive(s_state.state_mutex);
+
+    if (dev_hdl == NULL) {
+        return -ENODEV;
+    }
+    if (payload_len > CONFIG_USBIP_MAX_TRANSFER) {
+        return -EMSGSIZE;
     }
 
     usb_transfer_t *transfer = NULL;
@@ -630,7 +620,12 @@ static int process_bulk_request(const usb_backend_bulk_req_t *req)
         return -ENOMEM;
     }
 
-    if (!is_in && req->out_len > 0 && req->out_data != NULL) {
+    if (is_control) {
+        memcpy(transfer->data_buffer, &req->setup, USB_SETUP_PACKET_SIZE);
+        if (!is_in && req->out_len > 0 && req->out_data != NULL) {
+            memcpy(transfer->data_buffer + USB_SETUP_PACKET_SIZE, req->out_data, req->out_len);
+        }
+    } else if (!is_in && req->out_len > 0 && req->out_data != NULL) {
         memcpy(transfer->data_buffer, req->out_data, req->out_len);
     }
 
@@ -646,36 +641,57 @@ static int process_bulk_request(const usb_backend_bulk_req_t *req)
     transfer->num_bytes = xfer_len;
     transfer->timeout_ms = 5000;
 
-    err = usb_host_transfer_submit(transfer);
+    if (is_control) {
+        err = usb_host_transfer_submit_control(s_state.client_hdl, transfer);
+    } else {
+        err = usb_host_transfer_submit(transfer);
+    }
     if (err != ESP_OK) {
+        ESP_LOGW(TAG, "submit failed: %s (ep=0x%02x)", esp_err_to_name(err), req->endpoint_addr);
         usb_host_transfer_free(transfer);
-        if (err == ESP_ERR_INVALID_STATE) {
-            return -ENODEV;
-        }
-        return -EIO;
+        return (err == ESP_ERR_INVALID_STATE) ? -ENODEV : -EIO;
     }
 
+    bool cancelled = false;
     while (!done_ctx.done) {
-        if (req->cancel != NULL && *req->cancel) {
-            usb_host_transfer_free(transfer);
-            return -ECONNRESET;
+        if (!cancelled && req->cancel != NULL && *req->cancel) {
+            cancelled = true;
         }
         err = usb_host_client_handle_events(s_state.client_hdl, pdMS_TO_TICKS(10));
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "client_handle_events error: %s, done=%d (ep=0x%02x)",
+                     esp_err_to_name(err), done_ctx.done, req->endpoint_addr);
             break;
         }
-        process_backend_events();
+    }
+
+    if (cancelled) {
+        usb_host_transfer_free(transfer);
+        return -ECONNRESET;
     }
 
     int status = map_transfer_status_to_errno(transfer->status);
+    if (status != 0) {
+        ESP_LOGW(TAG, "transfer failed: usb_status=%d errno=%d done=%d (ep=0x%02x)",
+                 transfer->status, status, done_ctx.done, req->endpoint_addr);
+    }
     if (status == 0 && is_in && req->in_data != NULL && req->in_capacity > 0) {
-        /* Cap to the original requested length, not the rounded-up xfer_len. */
-        size_t bytes = transfer->actual_num_bytes;
-        if (bytes > payload_len) {
-            bytes = payload_len;
+        size_t bytes;
+        if (is_control) {
+            bytes = (transfer->actual_num_bytes > USB_SETUP_PACKET_SIZE)
+                        ? (transfer->actual_num_bytes - USB_SETUP_PACKET_SIZE)
+                        : 0;
+        } else {
+            bytes = transfer->actual_num_bytes;
+            if (bytes > payload_len) {
+                bytes = payload_len;
+            }
         }
         const size_t copy_len = (bytes > req->in_capacity) ? req->in_capacity : bytes;
-        memcpy(req->in_data, transfer->data_buffer, copy_len);
+        const uint8_t *src = is_control
+            ? (transfer->data_buffer + USB_SETUP_PACKET_SIZE)
+            : transfer->data_buffer;
+        memcpy(req->in_data, src, copy_len);
         if (req->in_len_out != NULL) {
             *req->in_len_out = copy_len;
         }
@@ -723,41 +739,33 @@ static void usb_backend_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "USB backend task running");
+    ESP_LOGI(TAG, "USB backend task running (%d pipe slots)", USB_BACKEND_NUM_PIPES);
 
     while (true) {
-        err = usb_host_client_handle_events(s_state.client_hdl, pdMS_TO_TICKS(10));
+        /* Wait for a notification from a caller or a short timeout so we
+           still pump USB events regularly. */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+
+        err = usb_host_client_handle_events(s_state.client_hdl, 0);
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "usb_host_client_handle_events failed: %s", esp_err_to_name(err));
         }
 
         process_backend_events();
 
-        usb_backend_ctrl_req_t ctrl_req;
-        while (xQueueReceive(s_state.ctrl_req_queue, &ctrl_req, 0) == pdTRUE) {
-            int status = process_control_request(&ctrl_req);
-            if (ctrl_req.status_out != NULL) {
-                *ctrl_req.status_out = status;
+        /* Process all active pipe request slots. */
+        for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
+            usb_backend_pipe_req_t *pipe = &s_state.pipes[i];
+            if (!pipe->active) {
+                continue;
             }
-            xSemaphoreGive(ctrl_req.done_sem);
-        }
 
-        usb_backend_bulk_req_t bulk_req;
-        while (xQueueReceive(s_state.bulk_req_queue, &bulk_req, 0) == pdTRUE) {
-            int status = process_bulk_request(&bulk_req);
-            if (bulk_req.status_out != NULL) {
-                *bulk_req.status_out = status;
+            int status = process_pipe_request(pipe);
+            if (pipe->status_out != NULL) {
+                *pipe->status_out = status;
             }
-            xSemaphoreGive(bulk_req.done_sem);
-        }
-
-        usb_backend_bulk_req_t intr_req;
-        while (xQueueReceive(s_state.intr_req_queue, &intr_req, 0) == pdTRUE) {
-            int status = process_bulk_request(&intr_req);
-            if (intr_req.status_out != NULL) {
-                *intr_req.status_out = status;
-            }
-            xSemaphoreGive(intr_req.done_sem);
+            pipe->active = false;
+            xSemaphoreGive(pipe->done_sem);
         }
     }
 }
@@ -778,19 +786,12 @@ esp_err_t usb_backend_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    s_state.ctrl_req_queue = xQueueCreate(USB_BACKEND_QUEUE_LEN, sizeof(usb_backend_ctrl_req_t));
-    if (s_state.ctrl_req_queue == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    s_state.bulk_req_queue = xQueueCreate(USB_BACKEND_QUEUE_LEN, sizeof(usb_backend_bulk_req_t));
-    if (s_state.bulk_req_queue == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    s_state.intr_req_queue = xQueueCreate(USB_BACKEND_QUEUE_LEN, sizeof(usb_backend_bulk_req_t));
-    if (s_state.intr_req_queue == NULL) {
-        return ESP_ERR_NO_MEM;
+    /* Pre-allocate a binary semaphore for each pipe slot. */
+    for (int i = 0; i < USB_BACKEND_NUM_PIPES; i++) {
+        s_state.pipes[i].done_sem = xSemaphoreCreateBinary();
+        if (s_state.pipes[i].done_sem == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     s_state.event_queue = xQueueCreate(USB_BACKEND_EVENT_QUEUE_LEN, sizeof(usb_backend_event_t));
@@ -822,7 +823,7 @@ esp_err_t usb_backend_start(void)
                     USB_BACKEND_TASK_STACK,
                     NULL,
                     USB_BACKEND_TASK_PRIORITY,
-                    NULL) != pdPASS) {
+                    &s_state.task_hdl) != pdPASS) {
         return ESP_FAIL;
     }
 
@@ -869,6 +870,87 @@ bool usb_backend_get_device_by_busid(const char busid[32], usbip_backend_device_
     return found;
 }
 
+/* Look up the pre-assigned pipe slot for this device+endpoint,
+   fill it, wake the backend task, and wait. */
+static int submit_pipe_request(const char busid[32],
+                               uint8_t endpoint_addr,
+                               const usb_setup_packet_t *setup,
+                               const uint8_t *out_data,
+                               size_t out_len,
+                               uint8_t *in_data,
+                               size_t in_capacity,
+                               size_t *in_len,
+                               volatile bool *cancel)
+{
+    if (busid == NULL || in_len == NULL) {
+        return -EINVAL;
+    }
+
+    *in_len = 0;
+
+    /* Look up the pre-assigned pipe slot.  For non-zero endpoints that
+       haven't had interfaces claimed yet, use the EP0 pipe — the backend
+       task will claim interfaces (and assign proper pipe slots) before
+       submitting the transfer. */
+    int pipe_idx = -1;
+    xSemaphoreTake(s_state.state_mutex, portMAX_DELAY);
+    const int dev_slot = find_slot_by_busid_locked(busid);
+    if (dev_slot >= 0) {
+        if (endpoint_addr == 0) {
+            pipe_idx = s_state.devices[dev_slot].ep0_pipe;
+        } else {
+            const usbip_backend_device_t *device = &s_state.devices[dev_slot].device;
+            for (uint8_t i = 0; i < device->num_endpoints; i++) {
+                if (device->endpoints[i].address == endpoint_addr) {
+                    pipe_idx = s_state.devices[dev_slot].ep_pipes[i];
+                    break;
+                }
+            }
+            /* If interfaces aren't claimed yet, use the EP0 pipe slot
+               temporarily.  process_pipe_request will claim interfaces
+               before submitting the USB transfer. */
+            if (pipe_idx < 0) {
+                pipe_idx = s_state.devices[dev_slot].ep0_pipe;
+            }
+        }
+    }
+    xSemaphoreGive(s_state.state_mutex);
+
+    if (dev_slot < 0) {
+        return -ENODEV;
+    }
+    if (pipe_idx < 0) {
+        ESP_LOGW(TAG, "No pipe slot for ep=0x%02x on %s", endpoint_addr, busid);
+        return -ENODEV;
+    }
+    usb_backend_pipe_req_t *pipe = &s_state.pipes[pipe_idx];
+
+    int status = -EIO;
+
+    memcpy(pipe->busid, busid, sizeof(pipe->busid));
+    pipe->endpoint_addr = endpoint_addr;
+    if (setup != NULL) {
+        pipe->setup = *setup;
+    }
+    pipe->out_data = out_data;
+    pipe->out_len = out_len;
+    pipe->in_data = in_data;
+    pipe->in_capacity = in_capacity;
+    pipe->in_len_out = in_len;
+    pipe->status_out = &status;
+    pipe->cancel = cancel;
+
+    /* Mark active and wake the backend task. */
+    pipe->active = true;
+    xTaskNotifyGive(s_state.task_hdl);
+
+    /* Wait for the backend task to process this slot.  The semaphore is
+       pre-allocated so it can never be freed out from under us. */
+    xSemaphoreTake(pipe->done_sem, portMAX_DELAY);
+
+    return status;
+}
+
 int usb_backend_control_transfer(const char busid[32],
                                  const usb_setup_packet_t *setup,
                                  const uint8_t *out_data,
@@ -878,44 +960,13 @@ int usb_backend_control_transfer(const char busid[32],
                                  size_t *in_len,
                                  volatile bool *cancel)
 {
-    if (busid == NULL || setup == NULL || in_len == NULL) {
+    if (setup == NULL) {
         return -EINVAL;
     }
-
-    SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
-    if (done_sem == NULL) {
-        return -ENOMEM;
-    }
-
-    int status = -EIO;
-    *in_len = 0;
-
-    usb_backend_ctrl_req_t req;
-    memset(&req, 0, sizeof(req));
-
-    memcpy(req.busid, busid, sizeof(req.busid));
-    req.setup = *setup;
-    req.out_data = out_data;
-    req.out_len = out_len;
-    req.in_data = in_data;
-    req.in_capacity = in_capacity;
-    req.in_len_out = in_len;
-    req.status_out = &status;
-    req.cancel = cancel;
-    req.done_sem = done_sem;
-
-    if (xQueueSend(s_state.ctrl_req_queue, &req, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        vSemaphoreDelete(done_sem);
-        return -EAGAIN;
-    }
-
-    if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(7000)) != pdTRUE) {
-        vSemaphoreDelete(done_sem);
-        return -ETIMEDOUT;
-    }
-
-    vSemaphoreDelete(done_sem);
-    return status;
+    return submit_pipe_request(busid, 0, setup,
+                               out_data, out_len,
+                               in_data, in_capacity, in_len,
+                               cancel);
 }
 
 int usb_backend_bulk_transfer(const char busid[32],
@@ -927,44 +978,10 @@ int usb_backend_bulk_transfer(const char busid[32],
                               size_t *in_len,
                               volatile bool *cancel)
 {
-    if (busid == NULL || in_len == NULL) {
-        return -EINVAL;
-    }
-
-    SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
-    if (done_sem == NULL) {
-        return -ENOMEM;
-    }
-
-    int status = -EIO;
-    *in_len = 0;
-
-    usb_backend_bulk_req_t req;
-    memset(&req, 0, sizeof(req));
-
-    memcpy(req.busid, busid, sizeof(req.busid));
-    req.endpoint_addr = endpoint_addr;
-    req.out_data = out_data;
-    req.out_len = out_len;
-    req.in_data = in_data;
-    req.in_capacity = in_capacity;
-    req.in_len_out = in_len;
-    req.status_out = &status;
-    req.cancel = cancel;
-    req.done_sem = done_sem;
-
-    if (xQueueSend(s_state.bulk_req_queue, &req, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        vSemaphoreDelete(done_sem);
-        return -EAGAIN;
-    }
-
-    if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(7000)) != pdTRUE) {
-        vSemaphoreDelete(done_sem);
-        return -ETIMEDOUT;
-    }
-
-    vSemaphoreDelete(done_sem);
-    return status;
+    return submit_pipe_request(busid, endpoint_addr, NULL,
+                               out_data, out_len,
+                               in_data, in_capacity, in_len,
+                               cancel);
 }
 
 int usb_backend_interrupt_transfer(const char busid[32],
@@ -976,44 +993,10 @@ int usb_backend_interrupt_transfer(const char busid[32],
                                    size_t *in_len,
                                    volatile bool *cancel)
 {
-    if (busid == NULL || in_len == NULL) {
-        return -EINVAL;
-    }
-
-    SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
-    if (done_sem == NULL) {
-        return -ENOMEM;
-    }
-
-    int status = -EIO;
-    *in_len = 0;
-
-    usb_backend_bulk_req_t req;
-    memset(&req, 0, sizeof(req));
-
-    memcpy(req.busid, busid, sizeof(req.busid));
-    req.endpoint_addr = endpoint_addr;
-    req.out_data = out_data;
-    req.out_len = out_len;
-    req.in_data = in_data;
-    req.in_capacity = in_capacity;
-    req.in_len_out = in_len;
-    req.status_out = &status;
-    req.cancel = cancel;
-    req.done_sem = done_sem;
-
-    if (xQueueSend(s_state.intr_req_queue, &req, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        vSemaphoreDelete(done_sem);
-        return -EAGAIN;
-    }
-
-    if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(7000)) != pdTRUE) {
-        vSemaphoreDelete(done_sem);
-        return -ETIMEDOUT;
-    }
-
-    vSemaphoreDelete(done_sem);
-    return status;
+    return submit_pipe_request(busid, endpoint_addr, NULL,
+                               out_data, out_len,
+                               in_data, in_capacity, in_len,
+                               cancel);
 }
 
 bool usb_backend_is_interrupt_endpoint(const char busid[32], uint8_t ep_num, uint8_t direction)
