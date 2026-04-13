@@ -1,3 +1,5 @@
 [submodule "esp-idf"]
 	path = esp-idf
-	url = https://github.com/espressif/esp-idf.git
+	url = https://github.com/adafruit/esp-idf.git
+	branch = usbip-bridge
+
