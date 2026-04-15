@@ -16,6 +16,8 @@
 #include "usb/usb_host.h"
 #include "usb/usb_types_stack.h"
 
+#include "virtual_device.h"
+
 #if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_USBIP_S3_USB_OTG_DEVKIT_POWER
 #include "driver/gpio.h"
 #endif
@@ -848,6 +850,11 @@ size_t usb_backend_get_devices(usbip_backend_device_t *out_devices, size_t max_d
     }
     xSemaphoreGive(s_state.state_mutex);
 
+    /* Append virtual devices. */
+    if (copied < max_devices) {
+        copied += virtual_device_get_all(out_devices + copied, max_devices - copied);
+    }
+
     return copied;
 }
 
@@ -866,6 +873,14 @@ bool usb_backend_get_device_by_busid(const char busid[32], usbip_backend_device_
         found = true;
     }
     xSemaphoreGive(s_state.state_mutex);
+
+    if (!found) {
+        virtual_device_t *vdev = virtual_device_find_by_busid(busid);
+        if (vdev != NULL) {
+            *out_device = vdev->desc;
+            found = true;
+        }
+    }
 
     return found;
 }

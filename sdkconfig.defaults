@@ -12,6 +12,10 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_ESP32P4_REV_MIN_100=y
 
+# Enable PSRAM for logic capture sample buffer
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+
 # Enable USB host external hub support (single tier only to conserve
 # DWC HCD channels — multi-level hubs consume too many of the 8 available).
 CONFIG_USB_HOST_HUBS_SUPPORTED=y

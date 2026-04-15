@@ -7,3 +7,19 @@ dependencies:
     version: fsls-only
   espressif/mdns:
     version: ">=1.9.1"
+  logic_capture:
+    git: https://github.com/adafruit/esp-perfetto-logic.git
+    path: components/logic_capture
+    version: main
+  perfetto_trace:
+    git: https://github.com/adafruit/esp-perfetto-logic.git
+    path: components/perfetto_trace
+    version: main
+  sump:
+    git: https://github.com/adafruit/esp-perfetto-logic.git
+    path: components/sump
+    version: main
+  sump_io:
+    git: https://github.com/adafruit/esp-perfetto-logic.git
+    path: components/sump_io
+    version: main

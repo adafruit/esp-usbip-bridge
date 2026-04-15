@@ -9,6 +9,9 @@
 #include "network_init.h"
 #include "usb_backend.h"
 #include "usbip_server.h"
+#if CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER
+#include "virtual_perfetto_logic.h"
+#endif
 
 static const char *TAG = "app";
 
@@ -27,6 +30,9 @@ void app_main(void)
     ESP_ERROR_CHECK(network_init_start());
     ESP_ERROR_CHECK(log_server_start());
     ESP_ERROR_CHECK(usb_backend_start());
+#if CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER
+    ESP_ERROR_CHECK(virtual_perfetto_logic_start());
+#endif
     ESP_ERROR_CHECK(discovery_service_start());
     ESP_ERROR_CHECK(usbip_server_start());
 

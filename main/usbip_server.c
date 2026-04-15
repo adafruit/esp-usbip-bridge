@@ -1,5 +1,7 @@
 #include "usbip_server.h"
 
+#define LOG_LOCAL_LEVEL ESP_LOG_WARN
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -21,6 +23,7 @@
 
 #include "usb_backend.h"
 #include "usbip_protocol.h"
+#include "virtual_device.h"
 
 static const char *TAG = "usbip";
 
@@ -32,6 +35,8 @@ static bool read_exact(int fd, void *buf, size_t len)
     while (remaining > 0) {
         const ssize_t n = recv(fd, ptr, remaining, 0);
         if (n <= 0) {
+            ESP_LOGD(TAG, "read_exact: recv returned %zd (wanted %zu of %zu), errno=%d",
+                     n, remaining, len, errno);
             return false;
         }
         ptr += n;
@@ -286,7 +291,29 @@ static bool handle_submit(int fd,
     size_t in_len = 0;
     int status;
 
-    if (endpoint == 0) {
+    /* Check if this is a virtual device. */
+    virtual_device_t *vdev = virtual_device_find_by_busid(imported_busid);
+
+    if (vdev != NULL) {
+        /* Virtual device — dispatch to its ops. */
+        if (endpoint == 0) {
+            usb_setup_packet_t setup;
+            memcpy(&setup, request->u.cmd_submit.setup, sizeof(setup));
+            status = vdev->ops->control_transfer(vdev, &setup,
+                                                  out_buf,
+                                                  (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
+                                                  in_buf, in_cap, &in_len);
+            ESP_LOGI(TAG, "  vdev ctrl -> status=%d in_len=%zu", status, in_len);
+        } else {
+            const uint8_t ep_addr = (uint8_t)(endpoint |
+                                              (direction == USBIP_DIR_IN ? 0x80 : 0x00));
+            status = vdev->ops->data_transfer(vdev, ep_addr,
+                                               out_buf,
+                                               (direction == USBIP_DIR_OUT) ? (size_t)req_len : 0,
+                                               in_buf, in_cap, &in_len);
+            ESP_LOGI(TAG, "  vdev data ep=0x%02x -> status=%d in_len=%zu", ep_addr, status, in_len);
+        }
+    } else if (endpoint == 0) {
         /* Control transfer on EP0. */
         usb_setup_packet_t setup;
         memcpy(&setup, request->u.cmd_submit.setup, sizeof(setup));
@@ -387,6 +414,8 @@ static bool handle_urb_stream(int fd, const char imported_busid[32], uint32_t ex
         .cancel = false,
     };
 
+    const bool is_virtual = (virtual_device_find_by_busid(imported_busid) != NULL);
+
     while (true) {
         usbip_header_t request;
         if (!read_exact(fd, &request, sizeof(request))) {
@@ -398,19 +427,21 @@ static bool handle_urb_stream(int fd, const char imported_busid[32], uint32_t ex
 
         const uint32_t command = ntohl(request.base.command);
         if (command == USBIP_CMD_SUBMIT) {
-            /* Start a watchdog that sets cancel if the client disconnects
-               while we are blocked in a USB transfer. */
+            /* For real USB devices, start a watchdog that sets cancel if
+               the client disconnects while blocked in a USB transfer.
+               Virtual devices complete instantly and don't need this. */
             TaskHandle_t watchdog = NULL;
-            xTaskCreate(socket_watchdog_task, "sock_wd", 3072, &ctx,
-                        CONFIG_USBIP_SERVER_TASK_PRIORITY, &watchdog);
+            if (!is_virtual) {
+                xTaskCreate(socket_watchdog_task, "sock_wd", 3072, &ctx,
+                            CONFIG_USBIP_SERVER_TASK_PRIORITY, &watchdog);
+            }
 
             bool ok = handle_submit(fd, &request, imported_busid, expected_devid, &ctx.cancel);
 
-            /* Stop the watchdog if it's still running. */
-            ctx.cancel = true;
             if (watchdog != NULL) {
-                /* Give it time to exit */
-                vTaskDelay(pdMS_TO_TICKS(100));
+                /* Signal the watchdog to stop and give it time to exit. */
+                ctx.cancel = true;
+                vTaskDelay(pdMS_TO_TICKS(10));
             }
 
             if (!ok) {
@@ -431,12 +462,20 @@ static bool handle_urb_stream(int fd, const char imported_busid[32], uint32_t ex
 
 static bool handle_devlist_request(int fd)
 {
-    usbip_backend_device_t *devices = malloc(CONFIG_USBIP_MAX_DEVICES * sizeof(usbip_backend_device_t));
+    usbip_backend_device_t *devices = malloc((CONFIG_USBIP_MAX_DEVICES + VIRTUAL_DEVICE_MAX) * sizeof(usbip_backend_device_t));
     if (devices == NULL) {
+        ESP_LOGE(TAG, "DEVLIST: malloc failed");
         return false;
     }
 
-    const size_t device_count = usb_backend_get_devices(devices, CONFIG_USBIP_MAX_DEVICES);
+    const size_t device_count = usb_backend_get_devices(devices, CONFIG_USBIP_MAX_DEVICES + VIRTUAL_DEVICE_MAX);
+
+    ESP_LOGI(TAG, "DEVLIST: reporting %zu devices", device_count);
+    for (size_t i = 0; i < device_count; i++) {
+        ESP_LOGI(TAG, "  [%zu] busid=%.32s vid=%04x pid=%04x class=%02x speed=%"PRIu32" intfs=%u",
+                 i, devices[i].busid, devices[i].id_vendor, devices[i].id_product,
+                 devices[i].device_class, devices[i].speed, devices[i].num_interfaces);
+    }
 
     if (!send_op_common(fd, USBIP_OP_REP_DEVLIST, 0)) {
         free(devices);
@@ -464,17 +503,24 @@ static bool handle_import_request(int fd)
 {
     char requested_busid[32];
     if (!read_exact(fd, requested_busid, sizeof(requested_busid))) {
+        ESP_LOGW(TAG, "IMPORT: failed to read busid");
         return false;
     }
+
+    ESP_LOGI(TAG, "IMPORT: requested busid='%.32s'", requested_busid);
 
     usbip_backend_device_t device;
     const bool found = usb_backend_get_device_by_busid(requested_busid, &device);
 
+    ESP_LOGI(TAG, "IMPORT: device lookup %s (busid='%.32s')", found ? "FOUND" : "NOT FOUND", requested_busid);
+
     if (!send_op_common(fd, USBIP_OP_REP_IMPORT, found ? 0 : 1)) {
+        ESP_LOGW(TAG, "IMPORT: failed to send reply header");
         return false;
     }
 
     if (!found) {
+        ESP_LOGW(TAG, "IMPORT: device not found, closing");
         return true;
     }
 
@@ -498,28 +544,51 @@ static void handle_client(int fd)
 {
     usbip_op_common_t request;
     if (!read_exact(fd, &request, sizeof(request))) {
+        ESP_LOGW(TAG, "Failed to read op_common header (%d bytes)", (int)sizeof(request));
         return;
     }
 
     const uint16_t version = ntohs(request.version);
     const uint16_t code = ntohs(request.code);
 
+    ESP_LOGI(TAG, "Received op: version=0x%04x code=0x%04x status=0x%08"PRIx32,
+             version, code, (uint32_t)ntohl(request.status));
+
     if (version != USBIP_VERSION) {
-        ESP_LOGW(TAG, "Unsupported USB/IP version 0x%04x", version);
+        ESP_LOGW(TAG, "Unsupported USB/IP version 0x%04x (expected 0x%04x)", version, USBIP_VERSION);
         return;
     }
 
     if (code == USBIP_OP_REQ_DEVLIST) {
+        ESP_LOGI(TAG, "Handling DEVLIST request");
         (void)handle_devlist_request(fd);
         return;
     }
 
     if (code == USBIP_OP_REQ_IMPORT) {
+        ESP_LOGI(TAG, "Handling IMPORT request");
         (void)handle_import_request(fd);
         return;
     }
 
     ESP_LOGW(TAG, "Unsupported USB/IP op request 0x%04x", code);
+}
+
+typedef struct {
+    int fd;
+} client_task_ctx_t;
+
+static void client_task(void *arg)
+{
+    client_task_ctx_t *ctx = (client_task_ctx_t *)arg;
+    const int fd = ctx->fd;
+    free(ctx);
+
+    handle_client(fd);
+    close(fd);
+    ESP_LOGI(TAG, "Client disconnected");
+
+    vTaskDelete(NULL);
 }
 
 static void usbip_server_task(void *arg)
@@ -549,7 +618,7 @@ static void usbip_server_task(void *arg)
         return;
     }
 
-    if (listen(listen_fd, 1) < 0) {
+    if (listen(listen_fd, 4) < 0) {
         ESP_LOGE(TAG, "listen() failed: errno=%d", errno);
         close(listen_fd);
         vTaskDelete(NULL);
@@ -571,9 +640,22 @@ static void usbip_server_task(void *arg)
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
         ESP_LOGI(TAG, "Client connected");
-        handle_client(client_fd);
-        close(client_fd);
-        ESP_LOGI(TAG, "Client disconnected");
+
+        client_task_ctx_t *ctx = malloc(sizeof(client_task_ctx_t));
+        if (ctx == NULL) {
+            ESP_LOGW(TAG, "Failed to allocate client context");
+            close(client_fd);
+            continue;
+        }
+        ctx->fd = client_fd;
+
+        if (xTaskCreate(client_task, "usbip_client",
+                        CONFIG_USBIP_SERVER_TASK_STACK, ctx,
+                        CONFIG_USBIP_SERVER_TASK_PRIORITY, NULL) != pdPASS) {
+            ESP_LOGW(TAG, "Failed to create client task");
+            free(ctx);
+            close(client_fd);
+        }
     }
 }
 

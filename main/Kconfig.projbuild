@@ -126,3 +126,69 @@ config USBIP_NUM_PIPES
         DWC host controller channel count (16 for ESP32-P4, 8 for ESP32-S3).
 
 endmenu
+
+menu "Virtual Logic Capture Configuration"
+
+    config USBIP_VIRTUAL_LOGIC_ANALYZER
+        bool "Enable virtual logic analyzer"
+        default y
+        help
+            Expose a virtual USB device that streams logic-capture data
+            via Perfetto trace format over a CDC-ACM interface.
+
+    config LOGIC_CAPTURE_SAMPLE_RATE_HZ
+        int "Sample rate (Hz)"
+        default 1000000
+        depends on USBIP_VIRTUAL_LOGIC_ANALYZER
+
+    config LOGIC_CAPTURE_GPIO_D0
+        int "Channel 0 GPIO"
+        default 10
+        depends on USBIP_VIRTUAL_LOGIC_ANALYZER
+
+    config LOGIC_CAPTURE_GPIO_D1
+        int "Channel 1 GPIO"
+        default 11
+        depends on USBIP_VIRTUAL_LOGIC_ANALYZER
+
+    config LOGIC_CAPTURE_GPIO_D2
+        int "Channel 2 GPIO"
+        default 12
+        depends on USBIP_VIRTUAL_LOGIC_ANALYZER
+
+    config LOGIC_CAPTURE_GPIO_D3
+        int "Channel 3 GPIO"
+        default 13
+        depends on USBIP_VIRTUAL_LOGIC_ANALYZER
+
+    config LOGIC_CAPTURE_GPIO_D4
+        int "Channel 4 GPIO"
+        default -1
+        depends on USBIP_VIRTUAL_LOGIC_ANALYZER
+
+    config LOGIC_CAPTURE_GPIO_D5
+        int "Channel 5 GPIO"
+        default -1
+        depends on USBIP_VIRTUAL_LOGIC_ANALYZER
+
+    config LOGIC_CAPTURE_GPIO_D6
+        int "Channel 6 GPIO"
+        default -1
+        depends on USBIP_VIRTUAL_LOGIC_ANALYZER
+
+    config LOGIC_CAPTURE_GPIO_D7
+        int "Channel 7 GPIO"
+        default -1
+        depends on USBIP_VIRTUAL_LOGIC_ANALYZER
+
+    config LOGIC_CAPTURE_ENABLE_GPIO
+        int "Enable/valid input GPIO (-1 to disable)"
+        default -1
+        depends on USBIP_VIRTUAL_LOGIC_ANALYZER
+
+    config LOGIC_CAPTURE_ENABLE_ACTIVE_LOW
+        bool "Enable pin is active-low"
+        default n
+        depends on LOGIC_CAPTURE_ENABLE_GPIO != -1
+
+endmenu

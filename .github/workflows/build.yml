@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [p4-function-ev, m5stack-poe-p4, s3-usb-otg]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install ESP-IDF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget flex bison gperf python3 python3-pip \
+            python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util \
+            libusb-1.0-0
+
+      - name: Cache ESP-IDF tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.espressif
+          key: espressif-tools-${{ hashFiles('esp-idf/tools/idf_tools.py') }}
+
+      - name: Install ESP-IDF tools
+        run: |
+          ./esp-idf/install.sh esp32p4 esp32s3
+
+      - name: Build ${{ matrix.board }}
+        run: |
+          source ./esp-idf/export.sh
+          ./scripts/build-board.sh ${{ matrix.board }} build
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.board }}
+          path: |
+            build-${{ matrix.board }}/*.bin
+            build-${{ matrix.board }}/bootloader/*.bin
+            build-${{ matrix.board }}/partition_table/*.bin
+            build-${{ matrix.board }}/flasher_args.json
