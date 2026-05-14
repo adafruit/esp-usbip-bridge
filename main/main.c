@@ -12,6 +12,9 @@
 #if CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER
 #include "virtual_perfetto_logic.h"
 #endif
+#if CONFIG_USBIP_VIRTUAL_HARNESS
+#include "virtual_harness.h"
+#endif
 
 static const char *TAG = "app";
 
@@ -32,6 +35,9 @@ void app_main(void)
     ESP_ERROR_CHECK(usb_backend_start());
 #if CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER
     ESP_ERROR_CHECK(virtual_perfetto_logic_start());
+#endif
+#if CONFIG_USBIP_VIRTUAL_HARNESS
+    ESP_ERROR_CHECK(virtual_harness_start());
 #endif
     ESP_ERROR_CHECK(discovery_service_start());
     ESP_ERROR_CHECK(usbip_server_start());

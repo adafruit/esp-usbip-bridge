@@ -192,3 +192,16 @@ menu "Virtual Logic Capture Configuration"
         depends on LOGIC_CAPTURE_ENABLE_GPIO != -1
 
 endmenu
+
+menu "Virtual Test Harness Configuration"
+
+    config USBIP_VIRTUAL_HARNESS
+        bool "Enable virtual test harness"
+        default y
+        help
+            Expose a virtual USB CDC-ACM device that runs the esp-harness
+            SCPI test harness internally.  The device accepts SCPI commands
+            from a USB/IP host to drive GPIO, I2C, SPI, and UART buses on
+            the bridge MCU.
+
+endmenu

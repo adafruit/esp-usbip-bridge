@@ -3,3 +3,6 @@
 	url = https://github.com/adafruit/esp-idf.git
 	branch = usbip-bridge
 
+[submodule "esp-harness"]
+	path = esp-harness
+	url = git@github.com:adafruit/esp-harness.git

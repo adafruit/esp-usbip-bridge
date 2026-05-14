@@ -1,4 +1,5 @@
-set(req_components esp_event esp_netif esp_timer lwip nvs_flash usb mdns)
+set(req_components esp_event esp_netif esp_timer lwip nvs_flash usb mdns
+                   harness_io harness_scpi harness_dut)
 
 set(srcs
     "main.c"
@@ -9,12 +10,23 @@ set(srcs
     "usbip_server.c"
 )
 
-if(CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER)
-    list(APPEND req_components sump sump_io logic_capture perfetto_trace)
+if(CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER OR CONFIG_USBIP_VIRTUAL_HARNESS)
     list(APPEND srcs
         "virtual_device.c"
         "virtual_cdc.c"
+    )
+endif()
+
+if(CONFIG_USBIP_VIRTUAL_LOGIC_ANALYZER)
+    list(APPEND req_components sump sump_io logic_capture perfetto_trace)
+    list(APPEND srcs
         "virtual_perfetto_logic.c"
+    )
+endif()
+
+if(CONFIG_USBIP_VIRTUAL_HARNESS)
+    list(APPEND srcs
+        "virtual_harness.c"
     )
 endif()
 
