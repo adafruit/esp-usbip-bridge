@@ -269,11 +269,9 @@ static int urb_stream_find_by_seqnum(urb_stream_ctx_t *ctx, uint32_t seqnum)
     return -1;
 }
 
-/* Worker task: does the blocking USB transfer, sends the response,
-   and frees everything. */
-static void urb_worker_task(void *arg)
+/* Does the blocking USB transfer, sends the response, and frees everything. */
+static void urb_process(urb_work_item_t *item)
 {
-    urb_work_item_t *item = (urb_work_item_t *)arg;
     urb_stream_ctx_t *ctx = item->stream;
     const uint32_t direction = ntohl(item->request.base.direction);
     const uint32_t endpoint = ntohl(item->request.base.ep);
@@ -344,6 +342,13 @@ static void urb_worker_task(void *arg)
     free(item->out_data);
     free(item->in_data);
     free(item);
+}
+
+/* Task entry point for the real-device path. urb_process() must not delete the
+   calling task: virtual devices run it inline on the connection task. */
+static void urb_worker_task(void *arg)
+{
+    urb_process((urb_work_item_t *)arg);
     vTaskDelete(NULL);
 }
 
@@ -528,7 +533,7 @@ static bool handle_urb_stream(int fd, const char imported_busid[32],
         /* Virtual devices complete instantly, so we can run them
            inline and avoid the task creation overhead. */
         if (is_virtual) {
-            urb_worker_task(item);
+            urb_process(item);
         } else {
             if (xTaskCreate(urb_worker_task, "urb_wrk",
                             CONFIG_USBIP_SERVER_TASK_STACK, item,
