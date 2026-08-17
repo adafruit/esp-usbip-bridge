@@ -33,3 +33,8 @@ CONFIG_USBIP_ETH_RMII_RXD1_GPIO=47
 
 # Neopixel on GPIO 27
 CONFIG_USBIP_NEOPIXEL_GPIO=27
+
+# ESP32-P4NRW32 has 32MB of in-package PSRAM. esp-perfetto-logic buffers
+# captures there, so without this the logic analyzer falls back to a 16KB
+# internal SRAM buffer and advertises 0 bytes of sample memory over SUMP.
+CONFIG_SPIRAM=y
