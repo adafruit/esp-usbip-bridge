@@ -5,4 +5,4 @@
 
 [submodule "esp-harness"]
 	path = esp-harness
-	url = git@github.com:adafruit/esp-harness.git
+	url = https://github.com/adafruit/esp-harness.git

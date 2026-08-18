@@ -36,6 +36,19 @@ USB/IP wire format is implemented from Linux kernel documentation:
 - `main/usbip_protocol.h`: protocol constants and packet structs
 - `main/Kconfig.projbuild`: board/server configuration options
 
+## Cloning
+
+The `esp-harness` submodule declares its own `esp-idf`, pinned to the same commit
+as the top-level one, and the build never reads it. Initialise selectively rather
+than with `--recursive` to avoid downloading a second full ESP-IDF:
+
+```bash
+git clone https://github.com/adafruit/esp-usbip-bridge.git
+cd esp-usbip-bridge
+git submodule update --init
+git -C esp-harness submodule update --init components/scpi_parser/upstream
+```
+
 ## ESP-IDF Setup
 
 This repository is pinned to ESP-IDF `v6.0-beta2` (latest 6.0 beta as of February 20, 2026).

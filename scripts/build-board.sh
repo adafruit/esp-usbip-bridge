@@ -68,7 +68,7 @@ if [[ -n "${PORT}" ]]; then
 fi
 
 idf.py -B "${BUILD_DIR}" \
-    "${PORT_ARGS[@]}" \
+    "${PORT_ARGS[@]+"${PORT_ARGS[@]}"}" \
     -DIDF_TARGET="${TARGET}" \
     -DSDKCONFIG="${SDKCONFIG_FILE}" \
     -DSDKCONFIG_DEFAULTS="${DEFAULTS}" \

@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# BASH_SOURCE is unset under zsh, the macOS default shell. Same idiom as
+# esp-idf/export.sh.
+if [ -n "${BASH_SOURCE-}" ]; then
+    _SELF="${BASH_SOURCE[0]}"
+elif [ -n "${ZSH_VERSION-}" ]; then
+    # shellcheck disable=SC2296
+    _SELF="${(%):-%x}"
+else
+    _SELF="$0"
+fi
+ROOT_DIR="$(cd "$(dirname "${_SELF}")/.." && pwd)"
 IDF_DIR="${ROOT_DIR}/esp-idf"
 
 if [[ ! -f "${IDF_DIR}/export.sh" ]]; then
