@@ -38,7 +38,7 @@ USB/IP wire format is implemented from Linux kernel documentation:
 
 ## ESP-IDF Setup
 
-This repository is pinned to ESP-IDF `v6.0-beta2` (latest 6.0 beta as of February 20, 2026).
+This repository pins ESP-IDF to a commit on the `adafruit/esp-idf` fork, two commits past `v6.0`. The fork carries the `usb_dwc` FS-only patch that `USB_DWC_FSLS_ONLY` depends on, so the pin cannot be replaced with an upstream release tag.
 
 1. Clone/install ESP-IDF locally for this project:
 
