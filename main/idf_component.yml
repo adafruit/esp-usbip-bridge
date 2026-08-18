@@ -11,15 +11,23 @@ dependencies:
     git: https://github.com/adafruit/esp-perfetto-logic.git
     path: components/logic_capture
     version: main
+    rules:
+      - if: "target in [esp32p4]"
   perfetto_trace:
     git: https://github.com/adafruit/esp-perfetto-logic.git
     path: components/perfetto_trace
     version: main
+    rules:
+      - if: "target in [esp32p4]"
   sump:
     git: https://github.com/adafruit/esp-perfetto-logic.git
     path: components/sump
     version: main
+    rules:
+      - if: "target in [esp32p4]"
   sump_io:
     git: https://github.com/adafruit/esp-perfetto-logic.git
     path: components/sump_io
     version: main
+    rules:
+      - if: "target in [esp32p4]"
