@@ -54,9 +54,12 @@ source ./scripts/idf-env.sh
 
 ## Build and Flash
 
-Two board profiles are provided:
+Four board profiles are provided:
 
 - `p4-function-ev`: ESP32-P4-Function-EV board, USB/IP over Ethernet
+- `m5stack-poe-p4`: M5Stack PoE ESP32-P4, USB/IP over Ethernet
+- `p4hil`: [P4HIL](https://github.com/tannewt/p4hil) hardware-in-the-loop
+  fixture, USB/IP over Ethernet
 - `s3-usb-otg`: ESP32-S3-USB-OTG board, USB/IP over Wi-Fi STA
 
 Set your serial port once (example):
@@ -66,8 +69,15 @@ export ESPPORT=/dev/ttyUSB0
 ```
 
 Console output defaults by target:
-- `p4-function-ev`: USB Serial/JTAG console
+- ESP32-P4 boards: USB Serial/JTAG console
 - `s3-usb-otg`: `UART0` console (to avoid USB host conflicts)
+
+Once running, a board announces itself over mDNS, so you do not need to know its
+address in advance:
+
+```bash
+avahi-browse -rt _usbip._tcp
+```
 
 ### ESP32-P4-Function-EV
 
